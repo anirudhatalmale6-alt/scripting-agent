@@ -1,0 +1,12 @@
+{
+  "_comment": "Scenario B – New feature: /api/wishlist POST endpoint added",
+  "pr_number": 43,
+  "changed_files": [
+    {
+      "filename": "app/routes/wishlist.py",
+      "status": "added",
+      "patch": "@@ -0,0 +1,20 @@\n+from flask import Blueprint, request, jsonify\n+\n+wishlist_bp = Blueprint('wishlist', __name__)\n+\n+@wishlist_bp.post('/api/wishlist')\n+def add_to_wishlist():\n+    \"\"\"Add a product to the user's wishlist.\"\"\"\n+    data = request.get_json()\n+    product_id = data.get('product_id')\n+    user_id = data.get('user_id')\n+    # TODO: persist to DB\n+    return jsonify({'status': 'added', 'product_id': product_id}), 201\n+\n+@wishlist_bp.get('/api/wishlist/<user_id>')\n+def get_wishlist(user_id):\n+    \"\"\"Retrieve a user's wishlist.\"\"\"\n+    # TODO: fetch from DB\n+    return jsonify({'user_id': user_id, 'items': []}), 200\n"
+    }
+  ],
+  "diff_text": "diff --git a/app/routes/wishlist.py b/app/routes/wishlist.py\nnew file mode 100644\nindex 000..abc\n--- /dev/null\n+++ b/app/routes/wishlist.py\n@@ -0,0 +1,20 @@\n+from flask import Blueprint, request, jsonify\n+\n+wishlist_bp = Blueprint('wishlist', __name__)\n+\n+@wishlist_bp.post('/api/wishlist')\n+def add_to_wishlist():\n+    data = request.get_json()\n+    product_id = data.get('product_id')\n+    user_id = data.get('user_id')\n+    return jsonify({'status': 'added', 'product_id': product_id}), 201\n+\n+@wishlist_bp.get('/api/wishlist/<user_id>')\n+def get_wishlist(user_id):\n+    return jsonify({'user_id': user_id, 'items': []}), 200\n"
+}

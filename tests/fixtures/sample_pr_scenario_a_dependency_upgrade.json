@@ -1,0 +1,12 @@
+{
+  "_comment": "Scenario A – Library upgrade: requests 2.28.0 → 2.31.0",
+  "pr_number": 42,
+  "changed_files": [
+    {
+      "filename": "requirements.txt",
+      "status": "modified",
+      "patch": "@@ -1,6 +1,6 @@\n-requests==2.28.0\n+requests==2.31.0\n openai\n python-dotenv\n flask\n langchain\n psutil"
+    }
+  ],
+  "diff_text": "diff --git a/requirements.txt b/requirements.txt\nindex abc..def 100644\n--- a/requirements.txt\n+++ b/requirements.txt\n@@ -1,6 +1,6 @@\n-requests==2.28.0\n+requests==2.31.0\n openai\n python-dotenv\n flask\n langchain\n psutil\n"
+}

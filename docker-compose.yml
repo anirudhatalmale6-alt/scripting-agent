@@ -1,0 +1,144 @@
+# =============================================================================
+# AI Performance Agent — Local Docker Stack
+#
+# Two decoupled agents:
+#   test-trigger-agent  (port 5001) — detects changes, generates/patches scripts
+#   rca-agent           (port 5000) — runs k6, AI RCA, Jira, Slack, Email
+#
+# Supporting services:
+#   mock-app    (port 8080) — simulated target app
+#   prometheus  (port 9090) — receives k6 metrics via remote-write
+#   grafana     (port 3000) — dashboard UI
+#
+# Usage:
+#   docker-compose up --build          # first run
+#   docker-compose up -d               # background
+#   docker-compose logs -f test-trigger-agent
+#   docker-compose logs -f rca-agent
+#   docker-compose down -v             # stop + remove volumes
+#
+# Webhooks:
+#   Test Trigger → POST http://localhost:5001/github-webhook
+#   RCA Agent    → POST http://localhost:5000/github-webhook
+# =============================================================================
+
+services:
+
+  # ── Test Trigger Agent ────────────────────────────────────────────────────
+  # Responsibilities: detect code changes, generate/update/health-check scripts,
+  #                   track commit checkpoints, post PR comments
+  test-trigger-agent:
+    build: .
+    container_name: test-trigger-agent
+    command: python test_trigger_agent.py
+    ports:
+      - "5001:5001"
+    env_file: .env
+    environment:
+      SFCC_SITE_URL: http://mock-app:8080
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_USERNAME: ""
+      K6_PROMETHEUS_RW_PASSWORD: ""
+      GRAFANA_RW_URL: http://prometheus:9090/api/v1/write
+      GRAFANA_USERNAME: ""
+      GRAFANA_API_KEY: ""
+    volumes:
+      - ./logs:/app/logs
+      - ./scripts:/app/scripts
+      - ./reports:/app/reports
+      - ./.commit_checkpoint.json:/app/.commit_checkpoint.json
+    depends_on:
+      - mock-app
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5001/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── RCA Agent ─────────────────────────────────────────────────────────────
+  # Responsibilities: run k6 perf tests, collect metrics, AI root cause analysis,
+  #                   Jira tickets, Slack/Email reports
+  rca-agent:
+    build: .
+    container_name: rca-agent
+    command: python rca_agent.py
+    ports:
+      - "5000:5000"
+    env_file: .env
+    environment:
+      SFCC_SITE_URL: http://mock-app:8080
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_USERNAME: ""
+      K6_PROMETHEUS_RW_PASSWORD: ""
+      GRAFANA_RW_URL: http://prometheus:9090/api/v1/write
+      GRAFANA_USERNAME: ""
+      GRAFANA_API_KEY: ""
+    volumes:
+      - ./logs:/app/logs
+      - ./scripts:/app/scripts
+      - ./reports:/app/reports
+    depends_on:
+      - mock-app
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
+  # ── Mock App ──────────────────────────────────────────────────────────────
+  mock-app:
+    image: python:3.11-slim
+    container_name: mock-app
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./mock_app.py:/app/mock_app.py:ro
+    working_dir: /app
+    command: python mock_app.py
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
+      interval: 15s
+      timeout: 5s
+      retries: 3
+
+  # ── Prometheus ────────────────────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: prometheus
+    ports:
+      - "9090:9090"
+    command:
+      - "--config.file=/etc/prometheus/prometheus.yml"
+      - "--web.enable-remote-write-receiver"
+      - "--storage.tsdb.retention.time=7d"
+    volumes:
+      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus_data:/prometheus
+    restart: unless-stopped
+
+  # ── Grafana ───────────────────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    container_name: grafana
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  grafana_data:

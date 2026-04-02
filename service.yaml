@@ -1,0 +1,39 @@
+# =============================================================================
+# Kubernetes Services — AI Performance Agent (EKS)
+# =============================================================================
+
+# ── Test Trigger Agent — internet-facing (receives GitHub webhooks) ───────────
+apiVersion: v1
+kind: Service
+metadata:
+  name: test-trigger-agent-service
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+spec:
+  type: LoadBalancer
+  selector:
+    app: test-trigger-agent
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 5001
+
+---
+
+# ── RCA Agent — internet-facing (receives GitHub webhooks + Slack triggers) ───
+apiVersion: v1
+kind: Service
+metadata:
+  name: rca-agent-service
+  annotations:
+    service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+spec:
+  type: LoadBalancer
+  selector:
+    app: rca-agent
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 5000

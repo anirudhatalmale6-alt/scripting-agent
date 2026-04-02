@@ -1,0 +1,215 @@
+version: 2.1
+
+# =============================================================================
+# AI Performance Agent — CircleCI Pipeline
+#
+# Pipeline:
+#   1. install    — pip + k6
+#   2. detect     — PRE health check → detect changes → generate/patch → POST check
+#   3. k6         — run all k6 scripts under scripts/<repo>/<env>/k6/
+#   4. loadrunner — run all loadrunner scripts under scripts/<repo>/<env>/loadrunner/
+#   5. selenium   — run all selenium scripts under scripts/<repo>/<env>/selenium/
+#   6. report     — post PR comment with full health + change summary
+# =============================================================================
+
+executors:
+  python-k6:
+    docker:
+      - image: cimg/python:3.11-node
+    working_directory: ~/project
+
+jobs:
+
+  # ── 1. Install ──────────────────────────────────────────────────────────────
+  install:
+    executor: python-k6
+    steps:
+      - checkout
+      - restore_cache:
+          keys:
+            - pip-v2-{{ checksum "requirements.txt" }}
+      - run:
+          name: Install Python dependencies
+          command: pip install -r requirements.txt
+      - run:
+          name: Install k6
+          command: |
+            curl -fsSL https://dl.k6.io/key.gpg | sudo gpg --dearmor -o /usr/share/keyrings/k6-archive-keyring.gpg
+            echo "deb [signed-by=/usr/share/keyrings/k6-archive-keyring.gpg] https://dl.k6.io/deb stable main" \
+              | sudo tee /etc/apt/sources.list.d/k6.list
+            sudo apt-get update && sudo apt-get install -y k6
+      - save_cache:
+          key: pip-v2-{{ checksum "requirements.txt" }}
+          paths:
+            - ~/.cache/pip
+      - persist_to_workspace:
+          root: ~/project
+          paths: [.]
+
+  # ── 2. Detect + Generate + Health Check ─────────────────────────────────────
+  detect:
+    executor: python-k6
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: PRE check + detect changes + generate/patch scripts + POST check
+          command: |
+            python - <<'EOF'
+            import os, sys
+            sys.path.insert(0, ".")
+            from agent.test_orchestrator import orchestrate
+
+            pr_number  = os.getenv("CIRCLE_PR_NUMBER")
+            commit_sha = os.getenv("CIRCLE_SHA1")
+
+            result = orchestrate(
+                pr_number=int(pr_number) if pr_number else None,
+                commit_sha=commit_sha if not pr_number else None,
+            )
+
+            print(result.to_markdown())
+
+            # Surface health check results
+            if result.pre_health:
+                print(f"\nPRE:  {result.pre_health.summary_line()}")
+            if result.post_health:
+                print(f"POST: {result.post_health.summary_line()}")
+            if result.scripts_fixed:
+                print(f"Fixed pre-existing failures: {result.scripts_fixed}")
+
+            if result.error:
+                print(f"ERROR: {result.error}", file=sys.stderr)
+                sys.exit(1)
+
+            # Fail CI if post-check has failures
+            if result.post_health and result.post_health.failing:
+                print(f"\n❌ {len(result.post_health.failing)} script(s) still failing after agent changes",
+                      file=sys.stderr)
+                sys.exit(1)
+            EOF
+      - persist_to_workspace:
+          root: ~/project
+          paths: [scripts, .commit_checkpoint.json]
+
+  # ── 3. k6 performance tests ─────────────────────────────────────────────────
+  k6:
+    executor: python-k6
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: Run k6 scripts (all repos / all envs)
+          command: |
+            export SFCC_SITE_URL="${SFCC_SITE_URL:-https://test.k6.io}"
+            export K6_PROMETHEUS_RW_SERVER_URL="$GRAFANA_RW_URL"
+            export K6_PROMETHEUS_RW_USERNAME="$GRAFANA_USERNAME"
+            export K6_PROMETHEUS_RW_PASSWORD="$GRAFANA_API_KEY"
+
+            # Find all k6 scripts in new repo/env/k6/ structure + legacy flat structure
+            SCRIPTS=$(find scripts -path "*/k6/*.js" -o -name "*.js" \
+                      | grep -v "test_generated\|test_concurrent\|node_modules" \
+                      | sort)
+
+            if [ -z "$SCRIPTS" ]; then
+              echo "No k6 scripts found — skipping"
+              exit 0
+            fi
+
+            FAILED=0
+            for script in $SCRIPTS; do
+              echo "▶ $script"
+              k6 run -o experimental-prometheus-rw "$script" || FAILED=$((FAILED+1))
+            done
+
+            [ $FAILED -eq 0 ] || { echo "❌ $FAILED script(s) failed"; exit 1; }
+
+  # ── 4. LoadRunner scripts ───────────────────────────────────────────────────
+  loadrunner:
+    executor: python-k6
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: Run LoadRunner scripts (all repos / all envs)
+          command: |
+            SCRIPTS=$(find scripts -path "*/loadrunner/*.py" | sort)
+
+            if [ -z "$SCRIPTS" ]; then
+              echo "No LoadRunner scripts found — skipping"
+              exit 0
+            fi
+
+            FAILED=0
+            for script in $SCRIPTS; do
+              echo "▶ $script"
+              python "$script" || FAILED=$((FAILED+1))
+            done
+
+            [ $FAILED -eq 0 ] || { echo "❌ $FAILED script(s) failed"; exit 1; }
+
+  # ── 5. Selenium tests ───────────────────────────────────────────────────────
+  selenium:
+    docker:
+      - image: cimg/python:3.11-browsers
+    working_directory: ~/project
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: Install Python dependencies
+          command: pip install -r requirements.txt
+      - run:
+          name: Run Selenium tests (all repos / all envs)
+          command: |
+            SCRIPTS=$(find scripts -path "*/selenium/*.py" | sort)
+
+            if [ -z "$SCRIPTS" ]; then
+              echo "No Selenium scripts found — skipping"
+              exit 0
+            fi
+
+            pytest $SCRIPTS -v --tb=short
+
+  # ── 6. Post PR comment ──────────────────────────────────────────────────────
+  report:
+    executor: python-k6
+    steps:
+      - attach_workspace:
+          at: ~/project
+      - run:
+          name: Post PR comment
+          command: |
+            python - <<'EOF'
+            import os, sys
+            sys.path.insert(0, ".")
+            from github_reporting import comment_pr
+
+            pr_number = os.getenv("CIRCLE_PR_NUMBER")
+            if not pr_number:
+                print("Not a PR build — skipping comment")
+                sys.exit(0)
+
+            comment_pr(
+                int(pr_number),
+                "✅ **CircleCI pipeline complete.**\n"
+                "k6, LoadRunner, and Selenium scripts (including AI-generated ones) all passed.\n"
+                "Scripts are namespaced under `scripts/<repo>/<env>/`."
+            )
+            EOF
+
+# ── Workflow ──────────────────────────────────────────────────────────────────
+workflows:
+  ai-perf-pipeline:
+    jobs:
+      - install
+      - detect:
+          requires: [install]
+      - k6:
+          requires: [detect]
+      - loadrunner:
+          requires: [detect]
+      - selenium:
+          requires: [detect]
+      - report:
+          requires: [k6, loadrunner, selenium]

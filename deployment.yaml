@@ -1,0 +1,141 @@
+# =============================================================================
+# Kubernetes Deployments — AI Performance Agent (EKS)
+#
+# Two decoupled deployments:
+#   test-trigger-agent  → detects changes, generates scripts, health checks
+#   rca-agent           → k6 runs, AI RCA, Jira, Slack, Email
+#
+# Deploy:
+#   kubectl apply -f k8s-secret.yaml
+#   kubectl apply -f deployment.yaml
+#   kubectl apply -f service.yaml
+# =============================================================================
+
+# ── Test Trigger Agent ────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: test-trigger-agent
+  labels:
+    app: test-trigger-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: test-trigger-agent
+  template:
+    metadata:
+      labels:
+        app: test-trigger-agent
+    spec:
+      containers:
+      - name: test-trigger-agent
+        image: xxxxx.dkr.ecr.us-east-1.amazonaws.com/ai-agent:latest
+        command: ["python", "test_trigger_agent.py"]
+        ports:
+        - containerPort: 5001
+        envFrom:
+        - secretRef:
+            name: ai-agent-secret
+        volumeMounts:
+        - name: scripts-volume
+          mountPath: /app/scripts
+        - name: logs-volume
+          mountPath: /app/logs
+        - name: reports-volume
+          mountPath: /app/reports
+        - name: checkpoint-volume
+          mountPath: /app/.commit_checkpoint.json
+          subPath: .commit_checkpoint.json
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5001
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5001
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: scripts-volume
+        emptyDir: {}
+      - name: logs-volume
+        emptyDir: {}
+      - name: reports-volume
+        emptyDir: {}
+      - name: checkpoint-volume
+        configMap:
+          name: commit-checkpoint
+          optional: true
+
+---
+
+# ── RCA Agent ─────────────────────────────────────────────────────────────────
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rca-agent
+  labels:
+    app: rca-agent
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rca-agent
+  template:
+    metadata:
+      labels:
+        app: rca-agent
+    spec:
+      containers:
+      - name: rca-agent
+        image: xxxxx.dkr.ecr.us-east-1.amazonaws.com/ai-agent:latest
+        command: ["python", "rca_agent.py"]
+        ports:
+        - containerPort: 5000
+        envFrom:
+        - secretRef:
+            name: ai-agent-secret
+        volumeMounts:
+        - name: scripts-volume
+          mountPath: /app/scripts
+        - name: logs-volume
+          mountPath: /app/logs
+        - name: reports-volume
+          mountPath: /app/reports
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 15
+          periodSeconds: 30
+        readinessProbe:
+          httpGet:
+            path: /
+            port: 5000
+          initialDelaySeconds: 10
+          periodSeconds: 10
+      volumes:
+      - name: scripts-volume
+        emptyDir: {}
+      - name: logs-volume
+        emptyDir: {}
+      - name: reports-volume
+        emptyDir: {}

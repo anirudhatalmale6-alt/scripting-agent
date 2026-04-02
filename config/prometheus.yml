@@ -1,0 +1,10 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+# k6 pushes metrics via remote-write (enabled by --web.enable-remote-write-receiver)
+# No scrape jobs needed — Prometheus just receives what k6 sends.
+scrape_configs:
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

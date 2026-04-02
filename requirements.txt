@@ -1,0 +1,9 @@
+requests
+openai
+python-dotenv
+flask
+langchain
+langchain-openai
+langsmith
+psutil
+selenium
