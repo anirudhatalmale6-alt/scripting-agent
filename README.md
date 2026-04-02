@@ -6,55 +6,251 @@ without manual edits.
 
 ---
 
+## How It Works — Full Flow
+
+```
+Developer pushes code to GitHub
+          │
+          ▼
+GitHub sends webhook event
+          │
+          ├─────────────────────────────────────────────────────────┐
+          ▼                                                         ▼
+POST :5001/github-webhook                             POST :5000/github-webhook
+Test Trigger Agent                                    RCA Agent
+(test_trigger_agent.py)                               (rca_agent.py)
+          │                                                         │
+          │  queued via WebhookQueue                                │  runs immediately
+          │  (multi-dev safe, FIFO)                                 │
+          ▼                                                         ▼
+test_orchestrator.py                                  run k6 perf tests
+          │                                           collect system metrics
+          │                                           AI root cause analysis
+  ┌───────┴────────────────────────────────┐          create Jira ticket
+  │                                        │          send Slack + Email report
+  │  STEP 1 — PRE Health Check             │
+  │  Run all existing k6 scripts           │
+  │  Record: passing / failing / skipped   │
+  │                                        │
+  │  STEP 2 — Fix Pre-existing Failures    │
+  │  Any script already failing?           │
+  │  → GPT rewrites it + re-validates      │
+  │                                        │
+  │  STEP 3 — Fetch Changed Files          │
+  │  GitHub API: /commits/{sha}/files      │
+  │  or /pulls/{n}/files for PRs           │
+  │                                        │
+  │  STEP 4 — Detect Changes               │
+  │  code_change_detector.py               │
+  │    │                                   │
+  │    ├── Scenario A: dep file changed?   │
+  │    │   requirements.txt / package.json │
+  │    │   → extract old→new versions      │
+  │    │   → DependencyChange list         │
+  │    │                                   │
+  │    └── Scenario B: source file added   │
+  │        or modified?                    │
+  │        .py / .cs / .js / .ts etc.      │
+  │        → regex scan for route decs     │
+  │          @app.post, [HttpGet], MapGet  │
+  │          Flask, FastAPI, ASP.NET,      │
+  │          Express, Django, Spring       │
+  │        → GPT fallback if no match      │
+  │        → FeatureChange list            │
+  │                                        │
+  │  STEP 5 — Generate / Update Scripts    │
+  │  script_generator.py                   │
+  │    │                                   │
+  │    ├── Script missing? → CREATE        │
+  │    │   GPT generates all 3 types       │
+  │    │                                   │
+  │    └── Script exists?  → UPDATE        │
+  │        GPT rewrites for new changes    │
+  │                                        │
+  │    Output path (auto-created):         │
+  │    scripts/<repo>/<env>/k6/            │
+  │    scripts/<repo>/<env>/loadrunner/    │
+  │    scripts/<repo>/<env>/selenium/      │
+  │                                        │
+  │  STEP 6 — Patch Existing Scripts       │
+  │  script_patcher.py                     │
+  │    Scenario A: find scripts that       │
+  │    reference upgraded package →        │
+  │    GPT rewrites for new version        │
+  │                                        │
+  │  STEP 7 — POST Health Check            │
+  │  Re-run all k6 scripts                 │
+  │  Compare before vs after:              │
+  │    PRE:  3 passing, 1 failing          │
+  │    POST: 4 passing, 0 failing ✅       │
+  │                                        │
+  │  STEP 8 — Save Checkpoint              │
+  │  .commit_checkpoint.json               │
+  │    sha, scripts_created,               │
+  │    scripts_updated, timestamp          │
+  │                                        │
+  └───────────────────────────────────────┘
+          │
+          ▼
+  Post PR comment (GitHub)
+  Send Slack notification
+```
+
+---
+
+## Multi-Developer Concurrent Push Handling
+
+```
+Dev A pushes commit abc123  ──┐
+Dev B pushes commit def456  ──┤──► WebhookQueue (FIFO)
+Dev C pushes commit ghi789  ──┘         │
+                                         │  processes one at a time
+                                    ┌────▼────┐
+                                    │ abc123  │ → detect → generate → checkpoint
+                                    └────┬────┘
+                                    ┌────▼────┐
+                                    │ def456  │ → detect → generate → checkpoint
+                                    └────┬────┘
+                                    ┌────▼────┐
+                                    │ ghi789  │ → detect → generate → checkpoint
+                                    └─────────┘
+
+If Dev C and D push before agent wakes up:
+  checkpoint = abc123
+  current    = ghi789
+  → compare abc123...ghi789 via GitHub API
+  → process def456, ghi789 in order (oldest first)
+  → no commits missed
+```
+
+---
+
+## Script Lifecycle
+
+```
+New endpoint detected in commit
+          │
+          ▼
+scripts/<repo>/<env>/k6/<slug>_perf_test.js   ← does it exist?
+          │
+    ┌─────┴──────┐
+    │ NO         │ YES
+    ▼            ▼
+  CREATE       UPDATE
+  GPT writes   GPT rewrites
+  from scratch for new changes
+    │            │
+    └─────┬──────┘
+          ▼
+  k6 validation (1 VU / 5s)
+          │
+    ┌─────┴──────┐
+    │ PASS       │ FAIL
+    ▼            ▼
+  Done ✅     GPT auto-fix
+              retry up to 5x
+                  │
+            ┌─────┴──────┐
+            │ PASS       │ FAIL
+            ▼            ▼
+          Done ✅    Flag for
+                    manual review
+                    + notify Slack
+```
+
+---
+
 ## Architecture
 
-Two decoupled agents:
-
 ```
-GitHub Push / PR
-      │
-      ├─► Test Trigger Agent  (port 5001)
-      │         │
-      │         ├─ PRE health check   — run all existing scripts, record baseline
-      │         ├─ Fix pre-failures   — auto-fix any already-broken scripts
-      │         ├─ Detect changes     — Scenario A (dep upgrade) / B (new feature)
-      │         ├─ Generate scripts   — CREATE new or UPDATE existing
-      │         ├─ Patch scripts      — update for dep/feature changes
-      │         ├─ POST health check  — confirm everything passes after changes
-      │         └─ Save checkpoint    — track processed commits in JSON
-      │
-      └─► RCA Agent           (port 5000)
-                │
-                ├─ Run k6 performance tests
-                ├─ Collect system metrics
-                ├─ AI root cause analysis
-                ├─ Create Jira tickets
-                └─ Send Slack + Email reports
+┌─────────────────────────────────────────────────────────────┐
+│                    Docker / Kubernetes                       │
+│                                                             │
+│  ┌──────────────────────┐   ┌──────────────────────────┐   │
+│  │  Test Trigger Agent  │   │       RCA Agent          │   │
+│  │     port 5001        │   │       port 5000          │   │
+│  │                      │   │                          │   │
+│  │  code_change_detector│   │  tools/k6.py             │   │
+│  │  script_generator    │   │  ai_root_cause.py        │   │
+│  │  script_patcher      │   │  Jira / Slack / Email    │   │
+│  │  script_health_check │   │                          │   │
+│  │  commit_tracker      │   │                          │   │
+│  └──────────┬───────────┘   └──────────────────────────┘   │
+│             │                                               │
+│  ┌──────────▼───────────────────────────────────────────┐  │
+│  │                   mock-app :8080                     │  │
+│  │              (simulated target app)                  │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                                                             │
+│  ┌─────────────────────┐   ┌──────────────────────────┐   │
+│  │   Prometheus :9090  │◄──│   k6 remote-write        │   │
+│  └──────────┬──────────┘   └──────────────────────────┘   │
+│             │                                               │
+│  ┌──────────▼──────────┐                                   │
+│  │    Grafana :3000    │                                   │
+│  └─────────────────────┘                                   │
+└─────────────────────────────────────────────────────────────┘
 ```
 
-### Script folder structure (auto-created, repo + env namespaced)
+---
+
+## Script Folder Structure
+
+All folders are created automatically — no pre-existing structure needed.
 
 ```
 scripts/
-  <repo_slug>/          e.g. cold-starr__startup-launcher/
+  <repo_slug>/                     e.g. cold-starr__startup-launcher/
     dev/
-      k6/               <slug>_perf_test.js
-      loadrunner/       <slug>_lr_test.py
-      selenium/         <slug>_selenium_test.py
+      k6/
+        api_orders_perf_test.js    ← generated for POST /api/orders
+        api_products_perf_test.js  ← generated for GET /api/products
+      loadrunner/
+        api_orders_lr_test.py
+        api_products_lr_test.py
+      selenium/
+        api_orders_selenium_test.py
+        api_products_selenium_test.py
     stage/
       k6/ loadrunner/ selenium/
     prod/
       k6/ loadrunner/ selenium/
+
+  owner__nopcommerce/              ← different repo, completely isolated
+    dev/
+      k6/ loadrunner/ selenium/
 ```
 
-No pre-existing folders needed — all directories are created on demand.
+Switch `GITHUB_REPO` in `.env` → next push creates a new isolated folder tree.
 
-### Commit checkpoint tracking
+---
 
-Every processed commit is recorded in `.commit_checkpoint.json`:
-- Tracks which scripts were created vs updated per commit
-- On next push, processes ALL commits since last checkpoint (not just latest)
-- Handles multi-developer concurrent pushes correctly
+## Commit Checkpoint
+
+Stored in `.commit_checkpoint.json` (gitignored, persists at runtime):
+
+```json
+{
+  "cold-starr/startup-launcher": {
+    "last_processed_sha": "abc123...",
+    "last_processed_at": "2026-04-02T10:00:00Z",
+    "history": [
+      {
+        "sha": "abc123...",
+        "processed_at": "2026-04-02T10:00:00Z",
+        "scripts_created": ["scripts/cold-starr__startup-launcher/dev/k6/api_orders_perf_test.js"],
+        "scripts_updated": [],
+        "feature_changes": [{"method": "POST", "path": "/api/orders"}],
+        "dependency_changes": [],
+        "summary": "Created 3 scripts."
+      }
+    ]
+  }
+}
+```
+
+View via API: `GET http://localhost:5001/checkpoint`
+Reset via API: `POST http://localhost:5001/checkpoint/reset`
 
 ---
 
@@ -78,62 +274,71 @@ ENV=dev
 SLACK_WEBHOOK=https://hooks.slack.com/...
 ```
 
-### 3. Run locally (Docker)
+### 3. Run locally
 
 ```bash
 docker-compose up --build
 ```
 
-| Service             | URL                          |
-|---------------------|------------------------------|
-| Test Trigger Agent  | http://localhost:5001        |
-| RCA Agent           | http://localhost:5000        |
-| Mock App            | http://localhost:8080        |
-| Prometheus          | http://localhost:9090        |
-| Grafana             | http://localhost:3000        |
+| Service            | URL                       | Purpose                        |
+|--------------------|---------------------------|--------------------------------|
+| Test Trigger Agent | http://localhost:5001     | Receives GitHub webhooks       |
+| RCA Agent          | http://localhost:5000     | Runs k6, AI analysis           |
+| Mock App           | http://localhost:8080     | Simulated target app           |
+| Prometheus         | http://localhost:9090     | Metrics storage                |
+| Grafana            | http://localhost:3000     | Dashboard (admin/admin)        |
 
 ### 4. Configure GitHub webhooks
 
-Point two webhooks at your agent host:
-- `POST /github-webhook` on port 5001 → Test Trigger Agent
-- `POST /github-webhook` on port 5000 → RCA Agent
+Add two webhooks in your repo → Settings → Webhooks:
 
-Events: **Push** + **Pull requests**, content type `application/json`.
+| Webhook URL                              | Events              |
+|------------------------------------------|---------------------|
+| `http://<host>:5001/github-webhook`      | Push + Pull request |
+| `http://<host>:5000/github-webhook`      | Push + Pull request |
+
+Content type: `application/json`
 
 ---
 
 ## Deploy to AWS (EKS)
 
 ```bash
-# Build and push image
-aws ecr get-login-password | docker login --username AWS --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+# 1. Fill in real values in k8s-secret.yaml
+
+# 2. Build and push image to ECR
+aws ecr get-login-password | docker login --username AWS \
+  --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
 docker build -t ai-agent .
 docker tag ai-agent:latest <account>.dkr.ecr.<region>.amazonaws.com/ai-agent:latest
 docker push <account>.dkr.ecr.<region>.amazonaws.com/ai-agent:latest
 
-# Deploy
+# 3. Update image URL in deployment.yaml, then apply
 kubectl apply -f k8s-secret.yaml
 kubectl apply -f deployment.yaml
 kubectl apply -f service.yaml
+
+# 4. Get LoadBalancer URLs
+kubectl get services
 ```
 
-Two LoadBalancer services are created — one per agent. Point your GitHub webhooks
-at the respective LoadBalancer DNS names.
+Two LoadBalancer services are created — point your GitHub webhooks at the
+respective DNS names on port 80.
 
 ---
 
-## Key files
+## Key Files
 
 | File | Purpose |
 |------|---------|
-| `test_trigger_agent.py` | Test Trigger Agent Flask app (port 5001) |
-| `rca_agent.py` | RCA Agent Flask app (port 5000) |
-| `agent/test_orchestrator.py` | Full pipeline: PRE check → detect → generate → POST check |
-| `agent/script_health_checker.py` | Runs existing scripts before/after changes |
-| `agent/script_generator.py` | CREATE / UPDATE k6, LoadRunner, Selenium scripts |
-| `agent/script_patcher.py` | GPT-powered in-place script patching |
-| `agent/code_change_detector.py` | Parses diffs, classifies Scenario A / B |
-| `agent/commit_tracker.py` | Checkpoint JSON — tracks processed commits |
-| `agent/concurrency.py` | File locks + webhook queue for multi-dev safety |
-| `.commit_checkpoint.json` | Runtime state — gitignored |
+| `test_trigger_agent.py` | Test Trigger Agent — port 5001 |
+| `rca_agent.py` | RCA Agent — port 5000 |
+| `agent/test_orchestrator.py` | Full pipeline orchestration |
+| `agent/code_change_detector.py` | Parses diffs → Scenario A / B |
+| `agent/script_generator.py` | CREATE / UPDATE k6, LoadRunner, Selenium |
+| `agent/script_patcher.py` | GPT patch for dep/feature changes |
+| `agent/script_health_checker.py` | PRE / POST script health checks |
+| `agent/commit_tracker.py` | Checkpoint JSON tracking |
+| `agent/concurrency.py` | File locks + webhook queue |
 | `tests/blackbox_test.py` | Full end-to-end test suite |
+| `.commit_checkpoint.json` | Runtime state (gitignored) |
