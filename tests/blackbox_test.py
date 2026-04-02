@@ -140,6 +140,23 @@ section("TEST 3 — Basic Push → k6 Runs + Report Written")
 
 reports_before = set(os.listdir("reports")) if os.path.exists("reports") else set()
 
+# Seed a minimal k6 script so the RCA agent has something to run
+_seed_script_dir = os.path.join("scripts", "blackbox-seed", "test", "k6")
+_seed_script_path = os.path.join(_seed_script_dir, "seed_health_check.js")
+os.makedirs(_seed_script_dir, exist_ok=True)
+if not os.path.exists(_seed_script_path):
+    with open(_seed_script_path, "w") as _f:
+        _f.write(
+            "import http from 'k6/http';\n"
+            "import { sleep } from 'k6';\n"
+            "export const options = { vus: 1, duration: '5s' };\n"
+            "export default function () {\n"
+            "  const base = __ENV.SFCC_SITE_URL || 'http://localhost:8080';\n"
+            "  http.get(base + '/');\n"
+            "  sleep(1);\n"
+            "}\n"
+        )
+
 print(f"\n  {INFO} Triggering webhook asynchronously...")
 print(f"  {INFO} Polling for report file (k6 runs ~2 min total)...\n")
 

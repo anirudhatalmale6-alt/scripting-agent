@@ -139,6 +139,20 @@ services:
       - prometheus
     restart: unless-stopped
 
+  # ── Filebrowser ───────────────────────────────────────────────────────────
+  filebrowser:
+    image: filebrowser/filebrowser:latest
+    container_name: filebrowser
+    ports:
+      - "8888:80"
+    volumes:
+      - .:/srv
+      - filebrowser_data:/database
+    environment:
+      FB_NOAUTH: "true"
+    restart: unless-stopped
+
 volumes:
   prometheus_data:
   grafana_data:
+  filebrowser_data:

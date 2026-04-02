@@ -40,16 +40,38 @@ Public API
 
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
-CHECKPOINT_FILE = ".commit_checkpoint.json"
+_DEFAULT_CHECKPOINT = ".commit_checkpoint.json"
+
+
+def _get_checkpoint_file() -> str:
+    """Return a writable checkpoint file path, falling back to a temp file."""
+    path = os.environ.get("CHECKPOINT_FILE", _DEFAULT_CHECKPOINT)
+    fallback = os.path.join(tempfile.gettempdir(), "commit_checkpoint.json")
+    try:
+        if os.path.exists(path):
+            with open(path, "a", encoding="utf-8"):
+                pass
+        else:
+            dir_ = os.path.dirname(os.path.abspath(path)) or "."
+            probe = os.path.join(dir_, ".write_probe")
+            with open(probe, "w") as f:
+                f.write("")
+            os.remove(probe)
+        return path
+    except OSError:
+        print(f"[tracker] WARNING: {path} is not writable, using {fallback}")
+        return fallback
 
 
 def _load() -> dict:
-    if os.path.exists(CHECKPOINT_FILE):
+    cp = _get_checkpoint_file()
+    if os.path.exists(cp):
         try:
-            with open(CHECKPOINT_FILE, "r", encoding="utf-8") as f:
+            with open(cp, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
@@ -57,7 +79,8 @@ def _load() -> dict:
 
 
 def _save(data: dict) -> None:
-    with open(CHECKPOINT_FILE, "w", encoding="utf-8") as f:
+    cp = _get_checkpoint_file()
+    with open(cp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 

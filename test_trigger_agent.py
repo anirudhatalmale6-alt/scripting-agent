@@ -136,13 +136,15 @@ def checkpoint():
 @app.route("/checkpoint/reset", methods=["POST"])
 def reset_checkpoint():
     """Reset checkpoint — next push will process from scratch."""
+    from agent.commit_tracker import _get_checkpoint_file, _load
     import json as _json
-    checkpoint_file = ".commit_checkpoint.json"
+    checkpoint_file = _get_checkpoint_file()
     if os.path.exists(checkpoint_file):
-        data = _json.load(open(checkpoint_file))
+        data = _load()
         if GITHUB_REPO in data:
             data[GITHUB_REPO]["last_processed_sha"] = None
-            _json.dump(data, open(checkpoint_file, "w"), indent=2)
+            with open(checkpoint_file, "w", encoding="utf-8") as _f:
+                _json.dump(data, _f, indent=2)
     return jsonify({"message": "Checkpoint reset"})
 
 
