@@ -19,6 +19,7 @@ Run:
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 
 from dotenv import load_dotenv
@@ -150,4 +151,54 @@ def reset_checkpoint():
 
 if __name__ == "__main__":
     log.info("Test Trigger Agent started on port 5001")
+
+    # ── Startup: generate scripts if none exist for this repo ─────────────────
+    def _startup_generate():
+        import time, threading, requests as _req
+        from agent.script_generator import repo_slug
+        import glob
+
+        if not GITHUB_REPO:
+            log.warning("[startup] GITHUB_REPO not set — skipping auto-generation")
+            return
+
+        env = os.getenv("ENV", "dev")
+        repo_dir = os.path.join("scripts", repo_slug(GITHUB_REPO), env, "k6")
+        existing = glob.glob(f"{repo_dir}/**/*.js", recursive=True) + \
+                   glob.glob(f"{repo_dir}/*.js")
+
+        if existing:
+            log.info(f"[startup] Scripts already exist ({len(existing)} found) — skipping auto-generation")
+            return
+
+        log.info(f"[startup] No scripts found for {GITHUB_REPO} — fetching latest commit and generating...")
+
+        # Wait a few seconds for the container network to be ready
+        time.sleep(5)
+
+        try:
+            token = os.getenv("GITHUB_TOKEN", "")
+            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+            r = _req.get(
+                f"https://api.github.com/repos/{GITHUB_REPO}/commits",
+                headers=headers, params={"per_page": 1}, timeout=15
+            )
+            if r.status_code != 200:
+                log.warning(f"[startup] GitHub API returned {r.status_code} — skipping")
+                return
+
+            commits = r.json()
+            if not commits:
+                log.warning("[startup] No commits found in repo")
+                return
+
+            latest_sha = commits[0]["sha"]
+            log.info(f"[startup] Generating scripts for latest commit {latest_sha[:8]}...")
+            result = orchestrate(commit_sha=latest_sha)
+            log.info(f"[startup] Done — {result.summary}")
+
+        except Exception as e:
+            log.error(f"[startup] Auto-generation failed: {e}")
+
+    threading.Thread(target=_startup_generate, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=False)

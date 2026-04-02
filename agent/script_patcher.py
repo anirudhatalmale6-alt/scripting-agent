@@ -170,6 +170,10 @@ def patch_for_feature(feature: FeatureChange, repo: str = "") -> List[PatchResul
     # Normalise path for matching (strip leading slash, replace params)
     path_slug = re.sub(r'[^a-z0-9]', '', feature.path.lower())
 
+    # If path_slug is empty (e.g. path is just "/"), skip — too broad to match safely
+    if not path_slug:
+        return results
+
     for script_path in scripts:
         content = _read(script_path)
 
@@ -240,14 +244,15 @@ Script:
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def patch_all(report: ChangeReport, repo: str = "") -> List[PatchResult]:
-    """Apply all patches scoped to the given repo's script folder."""
+    """
+    Apply patches scoped to the given repo's script folder.
+    Only patches for dependency upgrades — new/changed endpoints are
+    handled by generate_all, not the patcher.
+    """
     results: List[PatchResult] = []
 
     for dep in report.dependency_changes:
         results.extend(patch_for_dependency(dep, repo))
-
-    for feature in report.feature_changes:
-        results.extend(patch_for_feature(feature, repo))
 
     patched_count = sum(1 for r in results if r.patched)
     print(f"[script_patcher] Patched {patched_count}/{len(results)} scripts")

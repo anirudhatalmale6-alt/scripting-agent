@@ -1,17 +1,16 @@
 """
 tests/live_test.py
 ──────────────────
-Live test against a real GitHub repo using credentials from .env.
+Live end-to-end test using the running Docker stack + real GitHub repo.
 
-Tests:
-  1. GitHub credentials configured
-  2. GitHub API reachable
-  3. Latest commit fetched
-  4. Changed files returned
-  5. detect_changes runs against real diff
-  6. Scripts generated for any new features found
-  7. Scripts patched for any dependency changes found
-  8. Full orchestrate() call with real commit SHA
+Flow:
+  1. Verify Docker services are up (RCA agent, Prometheus, Grafana, target app)
+  2. Fetch latest commit from real GitHub repo
+  3. Detect changes from the commit diff
+  4. Fire webhook to RCA agent → triggers real k6 run against target app
+  5. Poll for report written to disk
+  6. Verify k6 actually ran scripts (not fake)
+  7. Verify Prometheus received real k6 metrics
 
 Run with:
     python tests/live_test.py
@@ -19,12 +18,20 @@ Run with:
 
 import os
 import sys
+import time
+import json
+import threading
 import requests
 
 from dotenv import load_dotenv
 load_dotenv()
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+
+AGENT_URL  = "http://localhost:5000"
+PROM_URL   = "http://localhost:9090"
+GRAFANA_URL = "http://localhost:3000"
+SFCC_URL   = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
 
 PASS = "\033[92m✅ PASS\033[0m"
 FAIL = "\033[91m❌ FAIL\033[0m"
@@ -46,9 +53,42 @@ def section(title):
     print(f"{'='*60}")
 
 # ─────────────────────────────────────────────────────────────────────────────
-# TEST — Real GitHub Repo
+# 1 — Docker stack health
 # ─────────────────────────────────────────────────────────────────────────────
-section("GitHub Live Test — Real Repo Commit Detection")
+section("1 — Docker Stack Health")
+
+try:
+    r = requests.get(f"{AGENT_URL}/", timeout=5)
+    check("RCA agent running", r.status_code == 200, r.text.strip())
+except Exception as e:
+    check("RCA agent running", False, str(e))
+    print(f"\n  ❌ RCA agent not reachable — is docker-compose up?")
+    sys.exit(1)
+
+try:
+    r = requests.get(f"{PROM_URL}/-/ready", timeout=5)
+    check("Prometheus running", r.status_code == 200)
+except Exception as e:
+    check("Prometheus running", False, str(e))
+
+try:
+    r = requests.get(f"{GRAFANA_URL}/api/health", timeout=5)
+    check("Grafana running", r.status_code == 200)
+except Exception as e:
+    check("Grafana running", False, str(e))
+
+try:
+    # api:8000 is Docker-internal — check via localhost from host machine
+    target_local = SFCC_URL.replace("host.docker.internal", "localhost").replace("api:", "localhost:")
+    r = requests.get(target_local, timeout=5)
+    check("Target app reachable", r.status_code < 500, f"{target_local} → {r.status_code}")
+except Exception as e:
+    check("Target app reachable", False, f"tried {SFCC_URL} as localhost — {e}")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2 — GitHub: fetch latest commit + detect changes
+# ─────────────────────────────────────────────────────────────────────────────
+section("2 — GitHub Commit Detection")
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN", "")
 GITHUB_REPO  = os.getenv("GITHUB_REPO", "")
@@ -59,109 +99,189 @@ if not GITHUB_TOKEN or not GITHUB_REPO:
 
 check("GitHub credentials configured", True, f"repo={GITHUB_REPO}")
 
-headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
+gh_headers = {"Authorization": f"token {GITHUB_TOKEN}", "Accept": "application/vnd.github+json"}
 latest_sha = None
 
-# ── Fetch latest commit ───────────────────────────────────────────────────────
 try:
     r = requests.get(
         f"https://api.github.com/repos/{GITHUB_REPO}/commits",
-        headers=headers, params={"per_page": 1}, timeout=10
+        headers=gh_headers, params={"per_page": 1}, timeout=10
     )
     if r.status_code in (401, 403):
-        check("GitHub API reachable", False, f"Auth failed ({r.status_code}) — check GITHUB_TOKEN in .env")
+        check("GitHub API reachable", False, f"Auth failed ({r.status_code}) — check GITHUB_TOKEN")
         sys.exit(1)
     elif r.status_code == 404:
-        check("GitHub API reachable", False, f"Repo not found ({r.status_code}) — check GITHUB_REPO={GITHUB_REPO}")
+        check("GitHub API reachable", False, f"Repo not found — check GITHUB_REPO={GITHUB_REPO}")
         sys.exit(1)
-    else:
-        check("GitHub API reachable", r.status_code == 200, f"status={r.status_code}")
-        if r.status_code == 200:
-            commits = r.json()
-            latest_sha = commits[0]["sha"] if commits else None
-            check("Latest commit found", bool(latest_sha), str(latest_sha)[:12] if latest_sha else "none")
+    check("GitHub API reachable", r.status_code == 200, f"status={r.status_code}")
+    commits = r.json()
+    latest_sha = commits[0]["sha"] if commits else None
+    check("Latest commit found", bool(latest_sha), (latest_sha or "none")[:12])
 except Exception as e:
     check("GitHub API reachable", False, str(e))
     sys.exit(1)
 
-if not latest_sha:
-    print(f"\n  {INFO} No commits found in repo — nothing to test")
-    sys.exit(0)
-
-# ── Fetch changed files ───────────────────────────────────────────────────────
 changed_files = []
 try:
     r = requests.get(
         f"https://api.github.com/repos/{GITHUB_REPO}/commits/{latest_sha}",
-        headers=headers, timeout=10
+        headers=gh_headers, timeout=10
     )
     check("Commit detail fetched", r.status_code == 200, f"sha={latest_sha[:8]}")
-    commit_data = r.json() if r.status_code == 200 else {}
-    changed_files = commit_data.get("files", [])
-    check("Changed files returned", isinstance(changed_files, list), f"{len(changed_files)} files")
+    changed_files = r.json().get("files", []) if r.status_code == 200 else []
+    check("Changed files returned", len(changed_files) > 0, f"{len(changed_files)} files")
 except Exception as e:
     check("Commit detail fetched", False, str(e))
 
-# ── Run detect_changes ────────────────────────────────────────────────────────
 from agent.code_change_detector import detect_changes
+report = detect_changes("", changed_files)
 
-real_report = detect_changes("", changed_files)
+print(f"\n  {INFO} Commit {latest_sha[:8]} — {len(changed_files)} files")
+print(f"  {INFO} Features detected  : {len(report.feature_changes)}")
+print(f"  {INFO} Dep changes        : {len(report.dependency_changes)}")
+for f in report.feature_changes:
+    print(f"       {f.method} {f.path}")
 
-print(f"\n  {INFO} Commit {latest_sha[:8]} — {len(changed_files)} files changed")
-print(f"  {INFO} Dependency changes : {len(real_report.dependency_changes)}")
-print(f"  {INFO} Feature changes    : {len(real_report.feature_changes)}")
-for d in real_report.dependency_changes:
-    print(f"       dep : {d.package} {d.old_version} → {d.new_version}")
-for f in real_report.feature_changes:
-    print(f"       feat: {f.method} {f.path}")
+check("detect_changes completed", True, "")
 
-check("detect_changes ran without error", True, "")
-check("ChangeReport returned", hasattr(real_report, "has_dependency_changes"), "")
+# ─────────────────────────────────────────────────────────────────────────────
+# 3 — Generate scripts locally (written to scripts/ volume shared with Docker)
+# ─────────────────────────────────────────────────────────────────────────────
+section("3 — Script Generation (local → shared volume)")
 
-# ── Generate scripts for new features ────────────────────────────────────────
-if real_report.has_feature_changes:
-    print(f"\n  {INFO} Generating scripts for {len(real_report.feature_changes)} feature(s)...")
-    from agent.script_generator import generate_all
-    generated = generate_all(real_report.feature_changes, env="dev")
-    check("Scripts generated", len(generated) > 0, f"{len(generated)} sets")
-    for gs in generated:
-        check(f"k6 script created: {os.path.basename(gs.k6_path)}",
-              os.path.exists(gs.k6_path), gs.k6_path)
-        check(f"k6 validated: {os.path.basename(gs.k6_path)}",
-              gs.k6_validated,
-              f"attempts={gs.k6_validation_attempts} err={gs.k6_validation_error[:80]}")
-else:
-    print(f"  {INFO} No new features in latest commit — script generation skipped")
-    check("No feature changes is valid outcome", True,
-          "Latest commit has no new endpoints — detection working correctly")
+# Clear checkpoint so orchestrate() always processes this commit fresh
+from agent.commit_tracker import _get_checkpoint_file
+import json as _json
 
-# ── Patch scripts for dependency changes ─────────────────────────────────────
-if real_report.has_dependency_changes:
-    from agent.script_patcher import patch_all
-    patch_results = patch_all(real_report)
-    patched = [p for p in patch_results if p.patched]
-    print(f"  {INFO} Patched {len(patched)}/{len(patch_results)} scripts for dep upgrade")
-    check("Script patching ran without error", True, f"patched={len(patched)}")
-else:
-    check("No dep changes is valid outcome", True,
-          "Latest commit has no dependency changes — detection working correctly")
+cp_file = _get_checkpoint_file()
+try:
+    if os.path.exists(cp_file):
+        with open(cp_file, "r", encoding="utf-8") as _f:
+            cp_data = _json.load(_f)
+        if GITHUB_REPO in cp_data:
+            cp_data[GITHUB_REPO]["last_processed_sha"] = None
+            with open(cp_file, "w", encoding="utf-8") as _f:
+                _json.dump(cp_data, _f, indent=2)
+    print(f"  {INFO} Checkpoint cleared for {GITHUB_REPO}")
+except Exception as e:
+    print(f"  {INFO} Could not clear checkpoint: {e} — continuing anyway")
 
-# ── Full orchestrate() ────────────────────────────────────────────────────────
-print(f"\n  {INFO} Running full orchestrate() with commit {latest_sha[:8]}...")
 from agent.test_orchestrator import orchestrate
 try:
     orch = orchestrate(commit_sha=latest_sha)
-    check("orchestrate() completed without exception", orch.error is None, orch.error or "ok")
-    check("OrchestrationResult has change_report", orch.change_report is not None, "")
-    md = orch.to_markdown()
-    check("to_markdown() produces output", len(md) > 50, f"{len(md)} chars")
-    print(f"\n  {INFO} Orchestration summary: {orch.summary}")
+    check("orchestrate() completed", orch.error is None, orch.error or "ok")
+    check("Scripts generated", len(orch.generated_scripts) > 0,
+          f"{len(orch.generated_scripts)} sets")
+    for gs in orch.generated_scripts[:3]:
+        check(f"k6 script on disk: {os.path.basename(gs.k6_path)}",
+              os.path.exists(gs.k6_path), gs.k6_path)
+    print(f"  {INFO} Summary: {orch.summary}")
 except Exception as e:
-    check("orchestrate() completed without exception", False, str(e))
+    check("orchestrate() completed", False, str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4 — Fire webhook → real k6 run inside Docker against target app
+# ─────────────────────────────────────────────────────────────────────────────
+section("4 — Webhook → k6 Run Against Real App")
+
+reports_before = set(os.listdir("reports")) if os.path.exists("reports") else set()
+
+result_box = {}
+def _fire():
+    try:
+        r = requests.post(
+            f"{AGENT_URL}/github-webhook",
+            json={"ref": "refs/heads/main", "head_commit": {"id": latest_sha}},
+            timeout=600
+        )
+        result_box["status"] = r.status_code
+        result_box["body"]   = r.json()
+    except Exception as e:
+        result_box["status"] = 0
+        result_box["error"]  = str(e)
+
+t = threading.Thread(target=_fire, daemon=True)
+t.start()
+print(f"\n  {INFO} Webhook fired for commit {latest_sha[:8]} — polling for report...")
+
+# Poll up to 5 minutes for a new report
+new_reports = set()
+for i in range(30):
+    time.sleep(10)
+    current = set(os.listdir("reports")) if os.path.exists("reports") else set()
+    new_reports = current - reports_before
+    if new_reports:
+        print(f"  {INFO} Report appeared after {(i+1)*10}s")
+        break
+    print(f"  {INFO} Waiting... {(i+1)*10}s")
+
+check("Report written to disk", bool(new_reports), str(new_reports))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 4 — Verify k6 actually ran (not fake)
+# ─────────────────────────────────────────────────────────────────────────────
+section("5 — k6 Results Verification")
+
+json_files = [f for f in new_reports if f.endswith(".json")]
+if json_files:
+    with open(f"reports/{sorted(json_files)[-1]}", encoding="utf-8") as f:
+        rdata = json.load(f)
+
+    k6 = rdata.get("tools_output", {}).get("k6", {})
+    scripts_run = k6.get("scripts_run", 0)
+    status      = k6.get("status", "unknown")
+
+    check("k6 ran at least 1 script",   scripts_run > 0,          f"scripts_run={scripts_run}")
+    # status=failed means threshold violations (e.g. 404 on parametrised endpoints) — not a k6 crash
+    check("k6 executed (completed or threshold fail)", status in ("completed", "failed"), f"status={status}")
+    check("AI analysis present",        bool(rdata.get("ai_analysis")), "")
+    check("System metrics present",     "cpu" in rdata.get("system", {}), "")
+
+    # Show which scripts ran
+    for r in k6.get("results", []):
+        label = "✅" if r.get("exit_code") == 0 else "❌"
+        print(f"  {INFO} {label} {r['script']} (exit {r.get('exit_code')})")
+else:
+    check("Report JSON found", False, "no .json report in reports/")
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 5 — Prometheus has real k6 metrics
+# ─────────────────────────────────────────────────────────────────────────────
+section("6 — Prometheus Metrics")
+
+try:
+    r = requests.get(
+        f"{PROM_URL}/api/v1/query",
+        params={"query": "k6_http_reqs_total"},
+        timeout=5
+    )
+    data = r.json()
+    metric_count = len(data.get("data", {}).get("result", []))
+    check("k6 metrics in Prometheus", metric_count > 0, f"series={metric_count}")
+except Exception as e:
+    check("k6 metrics in Prometheus", False, str(e))
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 6 — Script generation (from orchestrate via webhook, verify files on disk)
+# ─────────────────────────────────────────────────────────────────────────────
+section("7 — Generated Scripts on Disk")
+
+from agent.script_generator import repo_slug
+import glob as _glob
+
+repo_dir   = os.path.join("scripts", repo_slug(GITHUB_REPO))
+k6_scripts = _glob.glob(f"{repo_dir}/**/*.js", recursive=True)
+print(f"  {INFO} Looking in: {repo_dir}")
+check("Scripts folder created for repo", os.path.isdir(repo_dir), repo_dir)
+check("k6 scripts exist on disk", len(k6_scripts) > 0, f"{len(k6_scripts)} scripts")
+for s in k6_scripts:
+    size = os.path.getsize(s)
+    check(f"Script not empty: {os.path.basename(s)}", size > 100, f"{size} bytes")
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Summary
 # ─────────────────────────────────────────────────────────────────────────────
+t.join(timeout=5)
 passed = sum(1 for _, r in results if r)
 failed = sum(1 for _, r in results if not r)
 print(f"\n{'='*60}")

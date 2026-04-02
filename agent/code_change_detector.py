@@ -127,7 +127,7 @@ class ChangeReport:
 
     @property
     def needs_action(self) -> bool:
-        return self.has_dependency_changes or self.has_feature_changes
+        return self.has_dependency_changes
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────

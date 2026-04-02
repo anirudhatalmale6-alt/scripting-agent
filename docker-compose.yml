@@ -68,7 +68,7 @@ services:
       - "5000:5000"
     env_file: .env
     environment:
-      SFCC_SITE_URL: http://mock-app:8080
+      SFCC_SITE_URL: http://api:8000
       K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
       K6_PROMETHEUS_RW_USERNAME: ""
       K6_PROMETHEUS_RW_PASSWORD: ""
@@ -80,8 +80,10 @@ services:
       - ./scripts:/app/scripts
       - ./reports:/app/reports
     depends_on:
-      - mock-app
       - prometheus
+    networks:
+      - default
+      - app-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/"]
@@ -148,11 +150,14 @@ services:
     volumes:
       - .:/srv
       - filebrowser_data:/database
-    environment:
-      FB_NOAUTH: "true"
+    command: --noauth --root /srv --database /database/filebrowser.db --port 80
     restart: unless-stopped
 
 volumes:
   prometheus_data:
   grafana_data:
   filebrowser_data:
+
+networks:
+  app-network:
+    external: true
