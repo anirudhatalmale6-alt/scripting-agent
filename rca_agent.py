@@ -18,7 +18,6 @@ Run:
 """
 
 import gc
-import json
 import logging
 import os
 import sys
@@ -31,6 +30,7 @@ from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 from openai import OpenAI
 
+from agent.mcp_client import call_tool
 from email_service import send_email
 from report_writer import write_report
 from slack_service import send_slack
@@ -107,21 +107,7 @@ def detect_cpu_spike():
 # ── k6 ────────────────────────────────────────────────────────────────────────
 
 def run_k6():
-    from tools.k6 import run_k6_test
-    return run_k6_test()
-
-
-# ── MCP tool call ─────────────────────────────────────────────────────────────
-
-def call_tool(tool):
-    import requests as _req
-    try:
-        r = _req.post(MCP_URL,
-                      headers={"Authorization": f"Bearer {TOKEN}", "Content-Type": "application/json"},
-                      json={"tool": tool})
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+    return call_tool("k6")
 
 
 # ── Git diff ──────────────────────────────────────────────────────────────────
@@ -195,22 +181,7 @@ Performance Data: {data}"""
 # ── Jira ──────────────────────────────────────────────────────────────────────
 
 def create_jira_ticket(summary, description):
-    import requests as _req
-    try:
-        if not all([JIRA_URL, JIRA_EMAIL, JIRA_API_TOKEN, JIRA_PROJECT_KEY]) \
-                or "xxxxx" in str(JIRA_URL):
-            return {"status": "skipped"}
-        r = _req.post(
-            f"{JIRA_URL}/rest/api/3/issue",
-            json={"fields": {"project": {"key": JIRA_PROJECT_KEY},
-                             "summary": summary, "description": description,
-                             "issuetype": {"name": "Bug"}}},
-            headers={"Accept": "application/json", "Content-Type": "application/json"},
-            auth=(JIRA_EMAIL, JIRA_API_TOKEN),
-        )
-        return r.json()
-    except Exception as e:
-        return {"error": str(e)}
+    return call_tool("jira", {"summary": summary, "description": description})
 
 
 # ── Main RCA pipeline ─────────────────────────────────────────────────────────
@@ -219,7 +190,7 @@ def run_rca_pipeline(orch_markdown: str = "") -> dict:
     perf_data = {
         "k6":         run_k6(),
         "speedcurve": call_tool("speedcurve"),
-        "datadog":    call_tool("datadog_metrics"),
+        "datadog":    call_tool("datadog"),
     }
     infra_data = {
         "commits":  call_tool("github_commits"),

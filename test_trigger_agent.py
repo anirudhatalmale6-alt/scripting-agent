@@ -154,7 +154,7 @@ if __name__ == "__main__":
 
     # ── Startup: generate scripts if none exist AND no checkpoint for this repo ─
     def _startup_generate():
-        import time, requests as _req
+        import time
         from agent.script_generator import repo_slug
         from agent.commit_tracker import get_checkpoint, save_checkpoint
         import glob
@@ -199,43 +199,17 @@ if __name__ == "__main__":
                 log.warning(f"[startup] Could not bootstrap checkpoint: {e}")
             return
 
-        log.info(f"[startup] No scripts and no checkpoint for {GITHUB_REPO} — fetching latest commit and generating...")
+        log.info(f"[startup] No scripts and no checkpoint for {GITHUB_REPO} — running full repo scan...")
 
         # Wait a few seconds for the container network to be ready
         time.sleep(5)
 
         try:
-            token = os.getenv("GITHUB_TOKEN", "")
-            headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-            r = _req.get(
-                f"https://api.github.com/repos/{GITHUB_REPO}/commits",
-                headers=headers, params={"per_page": 1}, timeout=15
-            )
-            if r.status_code != 200:
-                log.warning(f"[startup] GitHub API returned {r.status_code} — skipping")
-                return
-
-            commits = r.json()
-            if not commits:
-                log.warning("[startup] No commits found in repo")
-                return
-
-            latest_sha = commits[0]["sha"]
-            log.info(f"[startup] Generating scripts for latest commit {latest_sha[:8]}...")
-            result = orchestrate(commit_sha=latest_sha)
-            log.info(f"[startup] Done — {result.summary}")
-
-            # Ensure checkpoint is saved even if no Scenario A/B changes were detected
-            if not get_checkpoint(GITHUB_REPO):
-                save_checkpoint(GITHUB_REPO, latest_sha, {
-                    "scripts_created": [],
-                    "scripts_updated": [],
-                    "dependency_changes": [],
-                    "feature_changes": [],
-                    "summary": "Startup run — no actionable changes detected; checkpoint anchored.",
-                })
-                log.info(f"[startup] Anchored checkpoint at {latest_sha[:8]} (no changes detected)")
-
+            from agent.test_orchestrator import scan_full_repo
+            result = scan_full_repo(repo=GITHUB_REPO, env=os.getenv("ENV", "dev"))
+            log.info(f"[startup] Full repo scan done — {result.summary}")
+            if result.error:
+                log.error(f"[startup] Scan error: {result.error}")
         except Exception as e:
             log.error(f"[startup] Auto-generation failed: {e}")
 

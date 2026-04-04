@@ -24,6 +24,35 @@
 
 services:
 
+  # ── MCP Tool Server ───────────────────────────────────────────────────────
+  # Exposes all tools (k6, grafana, jira, datadog, speedcurve, github, slack)
+  # as HTTP endpoints. Any agent calls this instead of importing tools directly.
+  mcp-server:
+    build: .
+    container_name: mcp-server
+    command: python mcp_server.py
+    ports:
+      - "5002:5002"
+    env_file: .env
+    environment:
+      SFCC_SITE_URL: http://mock-app:8080
+      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_USERNAME: ""
+      K6_PROMETHEUS_RW_PASSWORD: ""
+    volumes:
+      - ./logs:/app/logs
+      - ./scripts:/app/scripts
+      - ./reports:/app/reports
+    depends_on:
+      - mock-app
+      - prometheus
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5002/"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   # ── Test Trigger Agent ────────────────────────────────────────────────────
   # Responsibilities: detect code changes, generate/update/health-check scripts,
   #                   track commit checkpoints, post PR comments
@@ -42,6 +71,7 @@ services:
       GRAFANA_RW_URL: http://prometheus:9090/api/v1/write
       GRAFANA_USERNAME: ""
       GRAFANA_API_KEY: ""
+      MCP_URL: http://mcp-server:5002
     volumes:
       - ./logs:/app/logs
       - ./scripts:/app/scripts
@@ -50,6 +80,7 @@ services:
     depends_on:
       - mock-app
       - prometheus
+      - mcp-server
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/"]
@@ -75,12 +106,14 @@ services:
       GRAFANA_RW_URL: http://prometheus:9090/api/v1/write
       GRAFANA_USERNAME: ""
       GRAFANA_API_KEY: ""
+      MCP_URL: http://mcp-server:5002
     volumes:
       - ./logs:/app/logs
       - ./scripts:/app/scripts
       - ./reports:/app/reports
     depends_on:
       - prometheus
+      - mcp-server
     networks:
       - default
       - app-network

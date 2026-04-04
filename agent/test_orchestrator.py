@@ -239,6 +239,132 @@ status 200/201 checks, sleep(1). Return ONLY JS, no fences.
     return fixed
 
 
+# ── Full repo scan (first boot, no scripts exist) ────────────────────────────
+
+def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
+    """
+    Walk every commit in the repo history (oldest → newest), run
+    detect_changes on each commit's diff, accumulate all unique endpoints
+    and dependency changes, then generate scripts once per unique endpoint.
+
+    Called once on first boot when no scripts and no checkpoint exist.
+    Saves a checkpoint at HEAD so this never runs again on restart.
+    """
+    result = OrchestrationResult()
+    _repo = repo or GITHUB_REPO
+    _env  = env  or ENV
+
+    if not _repo:
+        result.error = "GITHUB_REPO not set"
+        return result
+
+    print(f"[orchestrator] Full commit-history scan — {_repo}")
+
+    # 1. Fetch all commits (oldest first, paginated)
+    all_commits = []
+    page = 1
+    while True:
+        try:
+            r = requests.get(
+                f"https://api.github.com/repos/{_repo}/commits",
+                headers=HEADERS,
+                params={"per_page": 100, "page": page},
+                timeout=30,
+            )
+            r.raise_for_status()
+            batch = r.json()
+            if not batch:
+                break
+            all_commits.extend(batch)
+            if len(batch) < 100:
+                break
+            page += 1
+        except Exception as e:
+            result.error = f"Could not fetch commits (page {page}): {e}"
+            return result
+
+    if not all_commits:
+        result.error = "No commits found in repo"
+        return result
+
+    # oldest → newest
+    all_commits.reverse()
+    head_sha = all_commits[-1]["sha"]
+    print(f"[orchestrator] {len(all_commits)} commits to scan (oldest→newest), HEAD={head_sha[:8]}")
+
+    # 2. Walk each commit, accumulate unique features + dep changes
+    from agent.code_change_detector import detect_changes, FeatureChange, DependencyChange
+
+    seen_endpoints: set = set()
+    all_features:   list[FeatureChange]    = []
+    all_dep_changes: list[DependencyChange] = []
+
+    for idx, commit in enumerate(all_commits, 1):
+        sha = commit["sha"]
+        msg = commit.get("commit", {}).get("message", "")[:60]
+        print(f"[orchestrator] [{idx}/{len(all_commits)}] {sha[:8]} — {msg}")
+
+        changed_files = _get_commit_files(sha)
+        if not changed_files:
+            continue
+
+        report = detect_changes("", changed_files)
+
+        # Accumulate dependency changes (all of them, no dedup needed)
+        all_dep_changes.extend(report.dependency_changes)
+
+        # Deduplicate endpoints by (method, path) — keep first occurrence
+        for f in report.feature_changes:
+            key = (f.method, f.path)
+            if key not in seen_endpoints:
+                seen_endpoints.add(key)
+                all_features.append(f)
+                print(f"[orchestrator]   + {f.method} {f.path} ({f.file})")
+
+    print(f"[orchestrator] Scan complete — {len(all_features)} unique endpoints, "
+          f"{len(all_dep_changes)} dep changes across {len(all_commits)} commits")
+
+    if not all_features:
+        result.summary = "No endpoints detected across commit history — no scripts generated."
+        save_checkpoint(_repo, head_sha, {
+            "scripts_created": [], "scripts_updated": [],
+            "dependency_changes": [], "feature_changes": [],
+            "summary": result.summary,
+        })
+        return result
+
+    # 3. Generate scripts for all unique endpoints (create or update, no blind overwrite)
+    print(f"[orchestrator] Generating scripts for {len(all_features)} endpoints...")
+    result.generated_scripts = generate_all(all_features, env=_env, repo=_repo)
+
+    # 4. Save checkpoint at HEAD — prevents re-scan on next restart
+    created_paths = []
+    for gs in result.generated_scripts:
+        created_paths += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+
+    save_checkpoint(_repo, head_sha, {
+        "scripts_created": created_paths,
+        "scripts_updated": [],
+        "dependency_changes": [
+            {"package": d.package, "old": d.old_version, "new": d.new_version}
+            for d in all_dep_changes
+        ],
+        "feature_changes": [{"method": f.method, "path": f.path} for f in all_features],
+        "summary": (
+            f"Full history scan: {len(all_commits)} commits, "
+            f"{len(all_features)} endpoints, {len(created_paths)} scripts generated."
+        ),
+    })
+
+    result.summary = (
+        f"Full history scan: {len(all_commits)} commits scanned, "
+        f"{len(all_features)} unique endpoints found, "
+        f"{len(result.generated_scripts) * 3} scripts generated."
+    )
+    print(f"[orchestrator] {result.summary}")
+    return result
+
+
 # ── Single-commit processing ──────────────────────────────────────────────────
 
 def _process_commit(sha: str, pre_health: HealthReport) -> dict:
