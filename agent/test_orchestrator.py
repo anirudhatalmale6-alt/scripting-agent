@@ -261,13 +261,13 @@ def _process_commit(sha: str, pre_health: HealthReport) -> dict:
         print(f"[orchestrator] {len(change_report.feature_changes)} feature(s) detected")
         generated = generate_all(change_report.feature_changes, env=ENV, repo=GITHUB_REPO)
         for gs in generated:
-            # Track create vs update based on whether file existed before generation
-            # (generate_scripts writes the file, so check mtime vs pre_health)
             pre_paths = {r.path for r in pre_health.results}
             if gs.k6_path in pre_paths:
                 scripts_updated += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
             else:
                 scripts_created += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+    else:
+        print(f"[orchestrator] {sha[:8]}: no Scenario A/B changes — checkpoint anchored, no scripts generated")
 
     if change_report.needs_action:
         patches = patch_all(change_report, repo=GITHUB_REPO)

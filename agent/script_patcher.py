@@ -58,11 +58,11 @@ class PatchResult:
 # ── File discovery ────────────────────────────────────────────────────────────
 
 def _find_scripts(repo: str = "") -> List[str]:
-    """Return all .js and .py test script paths, scoped to repo if provided."""
+    """Return all .js, .py, and .c test script paths, scoped to repo if provided."""
     from agent.script_generator import repo_slug
     base = os.path.join("scripts", repo_slug(repo)) if repo else "scripts"
     paths = []
-    for pattern in [f"{base}/**/*.js", f"{base}/**/*.py"]:
+    for pattern in [f"{base}/**/*.js", f"{base}/**/*.py", f"{base}/**/*.c"]:
         paths.extend(glob.glob(pattern, recursive=True))
     return paths
 
@@ -126,13 +126,14 @@ def patch_for_dependency(dep: DependencyChange, repo: str = "") -> List[PatchRes
 
 def _ai_patch_dependency(path: str, content: str, dep: DependencyChange) -> str:
     """Use GPT to rewrite a script after a dependency version change."""
+    lang = "LoadRunner VuGen C" if path.endswith(".c") else ("k6 JavaScript" if path.endswith(".js") else "Python")
     prompt = f"""
 You are a test automation engineer.
 
 The package '{dep.package}' was upgraded from version '{dep.old_version}'
 to version '{dep.new_version}'.
 
-Update the following test script so it works correctly with the new version.
+Update the following {lang} test script so it works correctly with the new version.
 Changes may include:
 - Updated import paths or API method names that changed between versions.
 - Adjusted latency thresholds if the new version is known to be faster/slower.
@@ -212,6 +213,7 @@ def patch_for_feature(feature: FeatureChange, repo: str = "") -> List[PatchResul
 
 def _ai_patch_feature(path: str, content: str, feature: FeatureChange) -> str:
     """Use GPT to update a test script for a changed endpoint."""
+    lang = "LoadRunner VuGen C" if path.endswith(".c") else ("k6 JavaScript" if path.endswith(".js") else "Python")
     prompt = f"""
 You are a test automation engineer.
 
@@ -220,7 +222,7 @@ The following endpoint was added or modified in the application:
   Path       : {feature.path}
   Description: {feature.description}
 
-Update the test script below so it correctly tests this endpoint.
+Update the {lang} test script below so it correctly tests this endpoint.
 Preserve all other tests in the file.
 If the endpoint is already correctly tested, return the script UNCHANGED.
 Return ONLY the updated script code, no markdown fences, no explanations.

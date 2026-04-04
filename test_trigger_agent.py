@@ -152,14 +152,21 @@ def reset_checkpoint():
 if __name__ == "__main__":
     log.info("Test Trigger Agent started on port 5001")
 
-    # ── Startup: generate scripts if none exist for this repo ─────────────────
+    # ── Startup: generate scripts if none exist AND no checkpoint for this repo ─
     def _startup_generate():
-        import time, threading, requests as _req
+        import time, requests as _req
         from agent.script_generator import repo_slug
+        from agent.commit_tracker import get_checkpoint, save_checkpoint
         import glob
 
         if not GITHUB_REPO:
             log.warning("[startup] GITHUB_REPO not set — skipping auto-generation")
+            return
+
+        # Skip if we already have a checkpoint — scripts were generated in a prior run
+        existing_checkpoint = get_checkpoint(GITHUB_REPO)
+        if existing_checkpoint:
+            log.info(f"[startup] Checkpoint exists ({existing_checkpoint[:8]}) — skipping auto-generation")
             return
 
         env = os.getenv("ENV", "dev")
@@ -169,9 +176,30 @@ if __name__ == "__main__":
 
         if existing:
             log.info(f"[startup] Scripts already exist ({len(existing)} found) — skipping auto-generation")
+            # Fetch latest SHA and save a checkpoint so we don't regenerate on next restart
+            try:
+                time.sleep(3)
+                token = os.getenv("GITHUB_TOKEN", "")
+                headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
+                r = _req.get(
+                    f"https://api.github.com/repos/{GITHUB_REPO}/commits",
+                    headers=headers, params={"per_page": 1}, timeout=15
+                )
+                if r.status_code == 200 and r.json():
+                    latest_sha = r.json()[0]["sha"]
+                    save_checkpoint(GITHUB_REPO, latest_sha, {
+                        "scripts_created": existing,
+                        "scripts_updated": [],
+                        "dependency_changes": [],
+                        "feature_changes": [],
+                        "summary": f"Bootstrapped checkpoint from {len(existing)} existing scripts.",
+                    })
+                    log.info(f"[startup] Bootstrapped checkpoint at {latest_sha[:8]}")
+            except Exception as e:
+                log.warning(f"[startup] Could not bootstrap checkpoint: {e}")
             return
 
-        log.info(f"[startup] No scripts found for {GITHUB_REPO} — fetching latest commit and generating...")
+        log.info(f"[startup] No scripts and no checkpoint for {GITHUB_REPO} — fetching latest commit and generating...")
 
         # Wait a few seconds for the container network to be ready
         time.sleep(5)
@@ -196,6 +224,17 @@ if __name__ == "__main__":
             log.info(f"[startup] Generating scripts for latest commit {latest_sha[:8]}...")
             result = orchestrate(commit_sha=latest_sha)
             log.info(f"[startup] Done — {result.summary}")
+
+            # Ensure checkpoint is saved even if no Scenario A/B changes were detected
+            if not get_checkpoint(GITHUB_REPO):
+                save_checkpoint(GITHUB_REPO, latest_sha, {
+                    "scripts_created": [],
+                    "scripts_updated": [],
+                    "dependency_changes": [],
+                    "feature_changes": [],
+                    "summary": "Startup run — no actionable changes detected; checkpoint anchored.",
+                })
+                log.info(f"[startup] Anchored checkpoint at {latest_sha[:8]} (no changes detected)")
 
         except Exception as e:
             log.error(f"[startup] Auto-generation failed: {e}")

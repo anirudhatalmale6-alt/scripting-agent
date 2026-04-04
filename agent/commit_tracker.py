@@ -80,6 +80,11 @@ def _load() -> dict:
 
 def _save(data: dict) -> None:
     cp = _get_checkpoint_file()
+    if os.path.isdir(cp):
+        raise RuntimeError(
+            f"[tracker] FATAL: checkpoint path '{cp}' is a directory, not a file. "
+            "Remove the directory and let the agent create the file."
+        )
     with open(cp, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
