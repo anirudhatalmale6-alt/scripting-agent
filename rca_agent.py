@@ -187,39 +187,58 @@ def create_jira_ticket(summary, description):
 # ── Main RCA pipeline ─────────────────────────────────────────────────────────
 
 def run_rca_pipeline(orch_markdown: str = "") -> dict:
+    # Run all tests — AI self-heals failures, only sends summary to AI analysis
+    test_results = call_tool("run_tests", {
+        "repo": os.getenv("GITHUB_REPO", ""),
+        "env":  os.getenv("ENV", "dev"),
+    })
+
     perf_data = {
-        "k6":         run_k6(),
-        "speedcurve": call_tool("speedcurve"),
-        "datadog":    call_tool("datadog"),
+        "test_results": test_results,
+        "speedcurve":   call_tool("speedcurve"),
+        "datadog":      call_tool("datadog"),
     }
     infra_data = {
         "commits":  call_tool("github_commits"),
         "git_diff": get_git_diff(),
     }
 
-    issues    = detect_anomalies(perf_data)
-    anomalies = extract_anomalies(perf_data)
+    # Only call AI if there are actual failures needing analysis
+    summary = test_results.get("summary", {})
+    has_failures = summary.get("needs_manual", 0) > 0 or summary.get("failed", 0) > 0
 
-    ai_result = ai_analysis({"performance": perf_data, "infra": infra_data, "issues": issues}) \
-        if ENABLE_AI == "true" else "AI disabled"
+    if ENABLE_AI == "true" and has_failures:
+        ai_result = ai_analysis({"performance": perf_data, "infra": infra_data,
+                                 "issues": test_results})
+    elif not has_failures:
+        ai_result = f"All tests passed. {summary.get('passed', 0)} scripts OK, " \
+                    f"{summary.get('ai_fixes_used', 0)} auto-fixed by AI."
+    else:
+        ai_result = "AI disabled"
 
-    jira = create_jira_ticket("Performance Regression Detected", str(ai_result))
+    # Only create Jira ticket if something needs manual review
+    jira = {}
+    if summary.get("needs_manual", 0) > 0:
+        manual = summary.get("manual_review", [])
+        jira = create_jira_ticket(
+            f"Test failures need manual review ({len(manual)} scripts)",
+            f"Scripts requiring manual fix:\n" + "\n".join(manual) + f"\n\nAI Analysis:\n{ai_result}"
+        )
 
     result = {
         "summary":    "AI Performance RCA",
-        "issues":     issues,
-        "anomalies":  anomalies,
+        "test_summary": summary,
         "diagnostics": {
             "latency": detect_latency_anomaly(),
             "memory":  detect_memory_trend(),
             "cpu":     detect_cpu_spike(),
         },
         "advanced_diagnostics": {
-            "thread_dump":    get_thread_dump(),
-            "heap_snapshot":  get_heap_snapshot(),
+            "thread_dump":   get_thread_dump(),
+            "heap_snapshot": get_heap_snapshot(),
         },
         "tools_output": {
-            "k6":         perf_data["k6"],
+            "tests":      test_results,
             "speedcurve": perf_data["speedcurve"],
             "datadog":    perf_data["datadog"],
             "github":     infra_data,
@@ -229,9 +248,12 @@ def run_rca_pipeline(orch_markdown: str = "") -> dict:
         "system":      get_system_metrics(),
     }
 
-    msg = f"""🚀 AI PERFORMANCE RCA REPORT
-ISSUES: {issues}
-AI ANALYSIS: {ai_result}"""
+    passed  = summary.get("passed", 0)
+    manual  = summary.get("needs_manual", 0)
+    ai_used = summary.get("ai_fixes_used", 0)
+    msg = f"""🚀 AI Performance RCA Report
+✅ Passed: {passed} | ⚠️ Needs manual: {manual} | 🔧 AI fixes used: {ai_used}
+{ai_result[:400]}"""
 
     try:
         write_report(result, orch_markdown)

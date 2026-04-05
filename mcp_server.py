@@ -49,8 +49,12 @@ app = Flask(__name__)
 
 TOOL_REGISTRY = {
     "k6": {
-        "description": "Run k6 performance test scripts and push metrics to Prometheus",
+        "description": "Run k6 performance test scripts with real load and AI self-heal on failure",
         "input": {"script_dir": "string (optional, default: scripts)"},
+    },
+    "run_tests": {
+        "description": "Run all k6 + Selenium scripts for a repo/env. AI fixes failures automatically, only flags what truly needs manual review.",
+        "input": {"repo": "string (optional)", "env": "string (optional, default: dev)"},
     },
     "grafana": {
         "description": "Fetch Grafana dashboards list or a specific dashboard by UID",
@@ -85,6 +89,26 @@ def _handle_k6(params: dict) -> dict:
     from tools.k6 import run_k6_test
     script_dir = params.get("script_dir", "scripts")
     return run_k6_test(script_dir=script_dir)
+
+
+def _handle_run_tests(params: dict) -> dict:
+    from tools.test_runner import run_all_k6, run_all_selenium, summarise
+    repo = params.get("repo", os.getenv("GITHUB_REPO", ""))
+    env  = params.get("env", os.getenv("ENV", "dev"))
+    k6_results  = run_all_k6(repo, env)
+    sel_results = run_all_selenium(repo, env)
+    all_results = k6_results + sel_results
+    summary = summarise(all_results)
+    log.info(f"[mcp] run_tests: {summary}")
+    return {
+        "summary": summary,
+        "k6":      [{"script": r.script, "passed": r.passed, "attempts": r.attempts,
+                     "ai_fixes": r.ai_fixes, "needs_manual": r.needs_manual,
+                     "error": r.error[:200] if r.error else ""} for r in k6_results],
+        "selenium": [{"script": r.script, "passed": r.passed, "attempts": r.attempts,
+                      "ai_fixes": r.ai_fixes, "needs_manual": r.needs_manual,
+                      "error": r.error[:200] if r.error else ""} for r in sel_results],
+    }
 
 
 def _handle_grafana(params: dict) -> dict:
@@ -206,6 +230,7 @@ def _handle_slack(params: dict) -> dict:
 
 _HANDLERS = {
     "k6":             _handle_k6,
+    "run_tests":      _handle_run_tests,
     "grafana":        _handle_grafana,
     "jira":           _handle_jira,
     "datadog":        _handle_datadog,

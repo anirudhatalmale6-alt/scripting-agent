@@ -61,6 +61,13 @@ def repo_slug(repo: str) -> str:
     return re.sub(r'[^a-z0-9_\-]+', '_', repo.lower()).replace('/', '__')
 
 
+def _strip_fences(code: str) -> str:
+    """Remove markdown code fences GPT sometimes adds despite instructions."""
+    lines = code.splitlines()
+    cleaned = [l for l in lines if not l.strip().startswith("```")]
+    return "\n".join(cleaned).strip()
+
+
 def _script_root(repo: str, env: str) -> str:
     """Base path: scripts/<repo_slug>/<env>"""
     rslug = repo_slug(repo) if repo else "default"
@@ -150,7 +157,7 @@ def _generate_k6(feature: FeatureChange, env: str) -> str:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Write a complete k6 JS performance test.
 Method: {feature.method} | Path: {feature.path} | Env: {env}
-{_APP_CONTEXT}
+{_app_context(feature)}
 - Fallback: __ENV.SFCC_SITE_URL || 'https://test.k6.io'
 - const IS_REAL_APP = !BASE_URL.includes('test.k6.io')
 - Wrap real calls in if (IS_REAL_APP) else http.get(BASE_URL)
@@ -159,7 +166,7 @@ Method: {feature.method} | Path: {feature.path} | Env: {env}
 - Return ONLY JS, no markdown fences."""}],
             temperature=0.2,
         )
-        script = resp.choices[0].message.content.strip()
+        script = _strip_fences(resp.choices[0].message.content.strip())
         return _inject_options_if_missing(script, feature)
     except Exception as e:
         print(f"[script_generator] GPT k6 failed: {e} — using template")
@@ -179,7 +186,7 @@ Keep IS_REAL_APP fallback. Return ONLY JS, no fences.
 {existing}"""}],
             temperature=0,
         )
-        return _inject_options_if_missing(resp.choices[0].message.content.strip(), feature)
+        return _inject_options_if_missing(_strip_fences(resp.choices[0].message.content.strip()), feature)
     except Exception as e:
         print(f"[script_generator] GPT k6 update failed: {e} — keeping existing")
         return existing
@@ -270,7 +277,7 @@ Return ONLY JS, no fences.
                     temperature=0,
                 )
                 fixed = _inject_options_if_missing(
-                    fixed_resp.choices[0].message.content.strip(), feature
+                    _strip_fences(fixed_resp.choices[0].message.content.strip()), feature
                 )
                 _write(script_path, fixed)
             except Exception as e:
@@ -281,18 +288,20 @@ Return ONLY JS, no fences.
 
 
 # ── LoadRunner (VuGen C format) ───────────────────────────────────────────────
-
-# Known SauceDemo / WebTours endpoint context injected into prompts so GPT
-# generates realistic scripts even without a live app diff.
-_APP_CONTEXT = """
-Target apps for reference:
-- SauceDemo (https://www.saucedemo.com): React SPA — pages: /inventory.html,
-  /cart.html, /checkout-step-one.html, /checkout-step-two.html,
-  /checkout-complete.html, /item/<id>.html. Login: POST username/password form.
-- WebTours (http://localhost:1080/WebTours/): Perl CGI app — pages: nav.pl,
-  login.pl, flights.pl, reservations.pl, itinerary.pl, merchandise.pl.
-  Login: POST to login.pl with username=jojo&password=bean.
-Use the app context to write realistic transactions matching the endpoint.
+def _app_context(feature: "FeatureChange" = None) -> str:
+    """Build prompt context from the actual repo and endpoint being tested."""
+    repo = os.getenv("GITHUB_REPO", "")
+    base_url = os.getenv("SFCC_SITE_URL", "https://your-app.com")
+    path = feature.path if feature else "/"
+    method = feature.method if feature else "GET"
+    desc = feature.description if feature else ""
+    return f"""
+Target repo  : {repo}
+Base URL     : {base_url}
+Endpoint     : {method} {path}
+Description  : {desc}
+Write realistic transactions for this specific endpoint only.
+Use the base URL and path above — do not reference SauceDemo or WebTours.
 """
 
 
@@ -367,7 +376,7 @@ def _generate_loadrunner(feature: FeatureChange) -> str:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Write a complete LoadRunner VuGen C script (.c file).
 Endpoint: {feature.method} {feature.path} — {feature.description}
-{_APP_CONTEXT}
+{_app_context(feature)}
 Requirements:
 - Use lr_start_transaction / lr_end_transaction with LR_AUTO
 - Use web_url() for GET, web_submit_data() for POST/PUT/PATCH
@@ -379,7 +388,7 @@ Requirements:
 - Return ONLY valid C code, no markdown fences, no Python."""}],
             temperature=0.2,
         )
-        return resp.choices[0].message.content.strip()
+        return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
         print(f"[script_generator] GPT LR failed: {e} — using template")
         return _lr_template(feature)
@@ -393,13 +402,13 @@ def _update_loadrunner(existing: str, feature: FeatureChange) -> str:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Update this LoadRunner VuGen C script for the modified endpoint.
 {feature.method} {feature.path} — {feature.description}
-{_APP_CONTEXT}
+{_app_context(feature)}
 Keep vuser_init/Action/vuser_end structure. Return ONLY C code, no fences.
 ---
 {existing}"""}],
             temperature=0,
         )
-        return resp.choices[0].message.content.strip()
+        return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
         print(f"[script_generator] GPT LR update failed: {e}")
         return existing
@@ -448,14 +457,14 @@ def _generate_selenium(feature: FeatureChange) -> str:
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Write a Python Selenium pytest test.
 {feature.method} {feature.path} — {feature.description}
-{_APP_CONTEXT}
+{_app_context(feature)}
 - os.getenv("SFCC_SITE_URL") for base URL
 - headless Chrome, WebDriverWait, assert title or element
 - function name: test_{_slug(feature.path)}
 Return ONLY Python, no fences."""}],
             temperature=0.2,
         )
-        return resp.choices[0].message.content.strip()
+        return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
         print(f"[script_generator] GPT Selenium failed: {e} — using template")
         return _selenium_template(feature)
@@ -474,7 +483,7 @@ Return ONLY Python, no fences.
 {existing}"""}],
             temperature=0,
         )
-        return resp.choices[0].message.content.strip()
+        return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
         print(f"[script_generator] GPT Selenium update failed: {e}")
         return existing

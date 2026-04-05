@@ -1,21 +1,12 @@
 # =============================================================================
 # AI Performance Agent — Local Docker Stack
 #
-# Two decoupled agents:
-#   test-trigger-agent  (port 5001) — detects changes, generates/patches scripts
-#   rca-agent           (port 5000) — runs k6, AI RCA, Jira, Slack, Email
-#
-# Supporting services:
-#   mock-app    (port 8080) — simulated target app
-#   prometheus  (port 9090) — receives k6 metrics via remote-write
-#   grafana     (port 3000) — dashboard UI
+# Agents watch GITHUB_REPO in .env for changes and generate/maintain
+# test scripts. The target app runs separately — set SFCC_SITE_URL in .env.
 #
 # Usage:
-#   docker-compose up --build          # first run
-#   docker-compose up -d               # background
+#   docker-compose up --build
 #   docker-compose logs -f test-trigger-agent
-#   docker-compose logs -f rca-agent
-#   docker-compose down -v             # stop + remove volumes
 #
 # Webhooks:
 #   Test Trigger → POST http://localhost:5001/github-webhook
@@ -25,8 +16,6 @@
 services:
 
   # ── MCP Tool Server ───────────────────────────────────────────────────────
-  # Exposes all tools (k6, grafana, jira, datadog, speedcurve, github, slack)
-  # as HTTP endpoints. Any agent calls this instead of importing tools directly.
   mcp-server:
     build: .
     container_name: mcp-server
@@ -35,7 +24,6 @@ services:
       - "5002:5002"
     env_file: .env
     environment:
-      SFCC_SITE_URL: http://mock-app:8080
       K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
       K6_PROMETHEUS_RW_USERNAME: ""
       K6_PROMETHEUS_RW_PASSWORD: ""
@@ -44,7 +32,6 @@ services:
       - ./scripts:/app/scripts
       - ./reports:/app/reports
     depends_on:
-      - mock-app
       - prometheus
     restart: unless-stopped
     healthcheck:
@@ -54,8 +41,6 @@ services:
       retries: 3
 
   # ── Test Trigger Agent ────────────────────────────────────────────────────
-  # Responsibilities: detect code changes, generate/update/health-check scripts,
-  #                   track commit checkpoints, post PR comments
   test-trigger-agent:
     build: .
     container_name: test-trigger-agent
@@ -64,7 +49,6 @@ services:
       - "5001:5001"
     env_file: .env
     environment:
-      SFCC_SITE_URL: http://mock-app:8080
       K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
       K6_PROMETHEUS_RW_USERNAME: ""
       K6_PROMETHEUS_RW_PASSWORD: ""
@@ -78,7 +62,6 @@ services:
       - ./reports:/app/reports
       - ./.commit_checkpoint.json:/app/.commit_checkpoint.json
     depends_on:
-      - mock-app
       - prometheus
       - mcp-server
     restart: unless-stopped
@@ -89,8 +72,6 @@ services:
       retries: 3
 
   # ── RCA Agent ─────────────────────────────────────────────────────────────
-  # Responsibilities: run k6 perf tests, collect metrics, AI root cause analysis,
-  #                   Jira tickets, Slack/Email reports
   rca-agent:
     build: .
     container_name: rca-agent
@@ -99,7 +80,6 @@ services:
       - "5000:5000"
     env_file: .env
     environment:
-      SFCC_SITE_URL: http://api:8000
       K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
       K6_PROMETHEUS_RW_USERNAME: ""
       K6_PROMETHEUS_RW_PASSWORD: ""
@@ -114,30 +94,10 @@ services:
     depends_on:
       - prometheus
       - mcp-server
-    networks:
-      - default
-      - app-network
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/"]
       interval: 30s
-      timeout: 5s
-      retries: 3
-
-  # ── Mock App ──────────────────────────────────────────────────────────────
-  mock-app:
-    image: python:3.11-slim
-    container_name: mock-app
-    ports:
-      - "8080:8080"
-    volumes:
-      - ./mock_app.py:/app/mock_app.py:ro
-    working_dir: /app
-    command: python mock_app.py
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/')"]
-      interval: 15s
       timeout: 5s
       retries: 3
 
@@ -190,7 +150,3 @@ volumes:
   prometheus_data:
   grafana_data:
   filebrowser_data:
-
-networks:
-  app-network:
-    external: true

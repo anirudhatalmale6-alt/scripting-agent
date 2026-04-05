@@ -2,19 +2,14 @@ import urllib.request
 import json
 import os
 
-API_KEY = os.environ["SPEEDCURVE_API_KEY"]
-SITE_ID = os.environ["SPEEDCURVE_SITE_ID"]
-
 def get_speedcurve_data():
-
-    url = f"https://api.speedcurve.com/v1/sites/{SITE_ID}"
-
+    api_key = os.getenv("SPEEDCURVE_API_KEY", "")
+    site_id = os.getenv("SPEEDCURVE_SITE_ID", "")
+    if not api_key or not site_id:
+        return {"status": "skipped", "reason": "SPEEDCURVE credentials not configured"}
+    url = f"https://api.speedcurve.com/v1/sites/{site_id}"
     req = urllib.request.Request(url)
-
-    req.add_header("Authorization", f"Bearer {API_KEY}")
+    req.add_header("Authorization", f"Bearer {api_key}")
     req.add_header("Accept", "application/json")
-
     with urllib.request.urlopen(req) as response:
-        data = json.loads(response.read().decode())
-
-    return data
+        return json.loads(response.read().decode())

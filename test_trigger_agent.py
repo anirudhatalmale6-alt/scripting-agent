@@ -149,69 +149,241 @@ def reset_checkpoint():
     return jsonify({"message": "Checkpoint reset"})
 
 
+@app.route("/self-heal", methods=["POST"])
+def self_heal():
+    """Manually trigger a self-heal run — finds and fixes all failing scripts."""
+    def _run():
+        from agent.script_health_checker import run_pre_check
+        from agent.test_orchestrator import _fix_failing_scripts
+        env = os.getenv("ENV", "dev")
+        report = run_pre_check(GITHUB_REPO, env)
+        if report.failing:
+            fixed = _fix_failing_scripts(report)
+            log.info(f"[self-heal] Manual run: fixed {len(fixed)}/{len(report.failing)}")
+        else:
+            log.info("[self-heal] Manual run: all scripts passing")
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"message": "Self-heal started — check logs for progress"}), 202
+
+
+@app.route("/run-tests", methods=["POST"])
+def run_tests():
+    """Run all k6 + Selenium scripts, AI fixes failures, returns summary."""
+    def _run():
+        from agent.mcp_client import call_tool
+        result = call_tool("run_tests", {
+            "repo": GITHUB_REPO,
+            "env":  os.getenv("ENV", "dev"),
+        })
+        summary = result.get("summary", {})
+        log.info(f"[run-tests] Done — {summary}")
+        if SLACK_WEBHOOK and "xxxx" not in SLACK_WEBHOOK:
+            try:
+                send_slack(
+                    f"🧪 *Test Run Complete*\n"
+                    f"✅ Passed: {summary.get('passed', 0)} | "
+                    f"⚠️ Manual: {summary.get('needs_manual', 0)} | "
+                    f"🔧 AI fixes: {summary.get('ai_fixes_used', 0)}\n"
+                    + ("\n".join(f"• `{s}`" for s in summary.get("manual_review", [])))
+                )
+            except Exception:
+                pass
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"message": "Test run started — check logs for progress"}), 202
+
+
 if __name__ == "__main__":
     log.info("Test Trigger Agent started on port 5001")
 
     # ── Startup: generate scripts if none exist AND no checkpoint for this repo ─
     def _startup_generate():
         import time
-        from agent.script_generator import repo_slug
+        import requests
+        from agent.script_generator import repo_slug, generate_scripts, _slug
         from agent.commit_tracker import get_checkpoint, save_checkpoint
-        import glob
+        from agent.code_change_detector import _parse_feature_diff, _ai_extract_features
+        import glob, base64
 
         if not GITHUB_REPO:
-            log.warning("[startup] GITHUB_REPO not set — skipping auto-generation")
+            log.warning("[startup] GITHUB_REPO not set — skipping")
             return
 
-        # Skip if we already have a checkpoint — scripts were generated in a prior run
-        existing_checkpoint = get_checkpoint(GITHUB_REPO)
-        if existing_checkpoint:
-            log.info(f"[startup] Checkpoint exists ({existing_checkpoint[:8]}) — skipping auto-generation")
-            return
+        time.sleep(5)  # wait for network
 
-        env = os.getenv("ENV", "dev")
-        repo_dir = os.path.join("scripts", repo_slug(GITHUB_REPO), env, "k6")
-        existing = glob.glob(f"{repo_dir}/**/*.js", recursive=True) + \
-                   glob.glob(f"{repo_dir}/*.js")
+        env       = os.getenv("ENV", "dev")
+        rslug     = repo_slug(GITHUB_REPO)
+        k6_dir    = os.path.join("scripts", rslug, env, "k6")
+        lr_dir    = os.path.join("scripts", rslug, env, "loadrunner")
+        sel_dir   = os.path.join("scripts", rslug, env, "selenium")
+        token     = os.getenv("GITHUB_TOKEN", "")
+        headers   = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
 
-        if existing:
-            log.info(f"[startup] Scripts already exist ({len(existing)} found) — skipping auto-generation")
-            # Fetch latest SHA and save a checkpoint so we don't regenerate on next restart
-            try:
-                time.sleep(3)
-                token = os.getenv("GITHUB_TOKEN", "")
-                headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-                r = _req.get(
-                    f"https://api.github.com/repos/{GITHUB_REPO}/commits",
-                    headers=headers, params={"per_page": 1}, timeout=15
-                )
-                if r.status_code == 200 and r.json():
-                    latest_sha = r.json()[0]["sha"]
-                    save_checkpoint(GITHUB_REPO, latest_sha, {
-                        "scripts_created": existing,
-                        "scripts_updated": [],
-                        "dependency_changes": [],
-                        "feature_changes": [],
-                        "summary": f"Bootstrapped checkpoint from {len(existing)} existing scripts.",
-                    })
-                    log.info(f"[startup] Bootstrapped checkpoint at {latest_sha[:8]}")
-            except Exception as e:
-                log.warning(f"[startup] Could not bootstrap checkpoint: {e}")
-            return
-
-        log.info(f"[startup] No scripts and no checkpoint for {GITHUB_REPO} — running full repo scan...")
-
-        # Wait a few seconds for the container network to be ready
-        time.sleep(5)
-
+        # ── Step 1: discover all endpoints in repo via commit history ─────────
+        log.info(f"[startup] Scanning commit history for endpoints in {GITHUB_REPO}...")
         try:
-            from agent.test_orchestrator import scan_full_repo
-            result = scan_full_repo(repo=GITHUB_REPO, env=os.getenv("ENV", "dev"))
-            log.info(f"[startup] Full repo scan done — {result.summary}")
-            if result.error:
-                log.error(f"[startup] Scan error: {result.error}")
+            all_commits, page = [], 1
+            while True:
+                r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/commits",
+                                 headers=headers, params={"per_page": 100, "page": page}, timeout=30)
+                if r.status_code != 200 or not r.json():
+                    break
+                batch = r.json()
+                all_commits.extend(batch)
+                if len(batch) < 100:
+                    break
+                page += 1
         except Exception as e:
-            log.error(f"[startup] Auto-generation failed: {e}")
+            log.error(f"[startup] Could not fetch commits: {e}")
+            return
+
+        if not all_commits:
+            log.warning("[startup] No commits found")
+            return
+
+        all_commits.reverse()  # oldest first
+        head_sha = all_commits[-1]["sha"]
+
+        # Collect all unique endpoints from commit history
+        seen, all_features = set(), []
+        for commit in all_commits:
+            sha = commit["sha"]
+            try:
+                r = requests.get(f"https://api.github.com/repos/{GITHUB_REPO}/commits/{sha}",
+                                 headers=headers, timeout=15)
+                if r.status_code != 200:
+                    continue
+                for f in r.json().get("files", []):
+                    patch = f.get("patch", "")
+                    fname = f.get("filename", "")
+                    features = _parse_feature_diff(fname, patch)
+                    if not features and patch:
+                        features = _ai_extract_features(fname, patch[:3000])
+                    for feat in features:
+                        key = (feat.method, feat.path)
+                        if key not in seen:
+                            seen.add(key)
+                            all_features.append(feat)
+            except Exception:
+                continue
+
+        log.info(f"[startup] Found {len(all_features)} unique endpoints across "
+                 f"{len(all_commits)} commits")
+
+        if not all_features:
+            log.warning("[startup] No endpoints detected — saving checkpoint and exiting")
+            save_checkpoint(GITHUB_REPO, head_sha, {
+                "scripts_created": [], "scripts_updated": [],
+                "dependency_changes": [], "feature_changes": [],
+                "summary": "Startup: no endpoints detected.",
+            })
+            return
+
+        # ── Step 2: check which scripts are missing on disk ───────────────────
+        missing = []
+        for feat in all_features:
+            slug = _slug(feat.path)
+            k6_path  = os.path.join(k6_dir,  f"{slug}_perf_test.js")
+            lr_path  = os.path.join(lr_dir,  f"{slug}_lr_test.c")
+            sel_path = os.path.join(sel_dir, f"{slug}_selenium_test.py")
+            # Generate if ANY of the 3 script types is missing
+            if not os.path.exists(k6_path) or \
+               not os.path.exists(lr_path) or \
+               not os.path.exists(sel_path):
+                missing.append(feat)
+
+        existing_count = len(all_features) - len(missing)
+        log.info(f"[startup] {existing_count}/{len(all_features)} scripts exist, "
+                 f"{len(missing)} need generating")
+
+        if not missing:
+            log.info("[startup] All scripts present — bootstrapping checkpoint")
+            # Also register any manually added scripts not in commit history
+            all_existing = (
+                glob.glob(os.path.join(k6_dir,  "**/*.js"),  recursive=True) +
+                glob.glob(os.path.join(lr_dir,  "**/*.c"),   recursive=True) +
+                glob.glob(os.path.join(sel_dir, "**/*.py"),  recursive=True)
+            )
+            save_checkpoint(GITHUB_REPO, head_sha, {
+                "scripts_created": all_existing,
+                "scripts_updated": [],
+                "dependency_changes": [],
+                "feature_changes": [{"method": f.method, "path": f.path}
+                                     for f in all_features],
+                "summary": (f"Startup: {len(all_features)} endpoints from commits, "
+                            f"{len(all_existing)} total scripts on disk registered."),
+            })
+            log.info(f"[startup] Registered {len(all_existing)} scripts "
+                     f"({len(all_features)} from commits, rest manually added)")
+            return
+
+        # ── Step 3: generate only missing scripts ─────────────────────────────
+        log.info(f"[startup] Generating {len(missing)} missing script sets...")
+        created = []
+        for feat in missing:
+            try:
+                gs = generate_scripts(feat, env=env, repo=GITHUB_REPO)
+                created += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+                log.info(f"[startup] Generated: {feat.method} {feat.path}")
+            except Exception as e:
+                log.error(f"[startup] Failed to generate {feat.path}: {e}")
+
+        # Also pick up any manually added scripts beyond what commits detected
+        all_existing = (
+            glob.glob(os.path.join(k6_dir,  "**/*.js"),  recursive=True) +
+            glob.glob(os.path.join(lr_dir,  "**/*.c"),   recursive=True) +
+            glob.glob(os.path.join(sel_dir, "**/*.py"),  recursive=True)
+        )
+
+        save_checkpoint(GITHUB_REPO, head_sha, {
+            "scripts_created": list(set(created + all_existing)),
+            "scripts_updated": [],
+            "dependency_changes": [],
+            "feature_changes": [{"method": f.method, "path": f.path}
+                                 for f in all_features],
+            "summary": (f"Startup gap-fill: {existing_count} existed, "
+                        f"{len(missing)} generated, "
+                        f"{len(all_existing)} total on disk registered."),
+        })
+        log.info(f"[startup] Done — {len(created)} generated, "
+                 f"{len(all_existing)} total scripts registered")
 
     threading.Thread(target=_startup_generate, daemon=True).start()
+
+    # ── Scheduled self-heal loop ──────────────────────────────────────────────
+    # Runs every SELF_HEAL_INTERVAL_MINUTES (default 60).
+    # Finds all failing k6 scripts and asks GPT to fix them — no commit needed.
+    def _self_heal_loop():
+        import time
+        interval = int(os.getenv("SELF_HEAL_INTERVAL_MINUTES", "60")) * 60
+        # Wait for startup scan to finish first
+        time.sleep(30)
+        while True:
+            try:
+                log.info("[self-heal] Starting scheduled health check...")
+                from agent.script_health_checker import run_pre_check
+                from agent.test_orchestrator import _fix_failing_scripts
+                env = os.getenv("ENV", "dev")
+                report = run_pre_check(GITHUB_REPO, env)
+                if report.failing:
+                    log.info(f"[self-heal] {len(report.failing)} failing scripts — attempting AI fix...")
+                    fixed = _fix_failing_scripts(report)
+                    log.info(f"[self-heal] Fixed {len(fixed)}/{len(report.failing)} scripts")
+                    if SLACK_WEBHOOK and "xxxx" not in SLACK_WEBHOOK:
+                        try:
+                            send_slack(
+                                f"🔧 *Self-Heal Report*\n"
+                                f"Found {len(report.failing)} failing scripts.\n"
+                                f"Auto-fixed: {len(fixed)}\n"
+                                f"Still failing: {len(report.failing) - len(fixed)}\n"
+                                + ("\n".join(f"• `{s}`" for s in fixed) if fixed else "")
+                            )
+                        except Exception:
+                            pass
+                else:
+                    log.info(f"[self-heal] All {len(report.passing)} scripts passing — nothing to fix")
+            except Exception as e:
+                log.error(f"[self-heal] Error: {e}")
+            time.sleep(interval)
+
+    threading.Thread(target=_self_heal_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=False)

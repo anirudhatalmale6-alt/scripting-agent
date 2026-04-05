@@ -2,36 +2,24 @@ import requests
 import os
 from requests.auth import HTTPBasicAuth
 
-JIRA_URL = os.environ["JIRA_URL"]
-EMAIL = os.environ["JIRA_EMAIL"]
-API_TOKEN = os.environ["JIRA_API_TOKEN"]
-PROJECT_KEY = os.environ["JIRA_PROJECT_KEY"]
-
 def create_jira_ticket(summary, description):
-
-    url = f"{JIRA_URL}/rest/api/3/issue"
-
-    auth = HTTPBasicAuth(EMAIL, API_TOKEN)
-
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json"
-    }
-
+    jira_url    = os.getenv("JIRA_URL", "")
+    email       = os.getenv("JIRA_EMAIL", "")
+    api_token   = os.getenv("JIRA_API_TOKEN", "")
+    project_key = os.getenv("JIRA_PROJECT_KEY", "")
+    if not all([jira_url, email, api_token, project_key]):
+        return {"status": "skipped", "reason": "Jira credentials not configured"}
+    url  = f"{jira_url}/rest/api/3/issue"
+    auth = HTTPBasicAuth(email, api_token)
     payload = {
         "fields": {
-            "project": {"key": PROJECT_KEY},
-            "summary": summary,
+            "project":     {"key": project_key},
+            "summary":     summary,
             "description": description,
-            "issuetype": {"name": "Bug"}
+            "issuetype":   {"name": "Bug"},
         }
     }
-
-    response = requests.post(
-        url,
-        json=payload,
-        headers=headers,
-        auth=auth
-    )
-
+    response = requests.post(url, json=payload,
+                             headers={"Accept": "application/json", "Content-Type": "application/json"},
+                             auth=auth)
     return response.json()
