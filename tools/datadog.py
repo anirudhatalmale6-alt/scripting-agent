@@ -12,5 +12,8 @@ def get_datadog_metrics():
     url  = f"https://api.datadoghq.com/api/v1/query?from={past}&to={now}&query=avg:system.cpu.user"
     req  = urllib.request.Request(url)
     req.add_header("DD-API-KEY", api_key)
-    with urllib.request.urlopen(req) as response:
-        return json.loads(response.read().decode())
+    try:
+        with urllib.request.urlopen(req, timeout=10) as response:
+            return json.loads(response.read().decode())
+    except Exception as e:
+        return {"status": "error", "reason": str(e)}
