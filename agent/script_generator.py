@@ -414,79 +414,334 @@ Keep vuser_init/Action/vuser_end structure. Return ONLY C code, no fences.
         return existing
 
 
-# ── Selenium ──────────────────────────────────────────────────────────────────
+# ── Selenium (Java / Maven / TestNG project) ──────────────────────────────────
+#
+# Generates a full Maven project per repo/env under:
+#   scripts/<repo>/<env>/selenium/
+#     pom.xml
+#     src/test/resources/testng.xml
+#     src/test/java/com/ecommerce/tests/BaseTest.java
+#     src/test/java/com/ecommerce/tests/<ClassName>Test.java
+#     src/test/java/com/ecommerce/pages/<ClassName>Page.java
+#
+# Run with: mvn clean test  (from the selenium/ folder)
+# ─────────────────────────────────────────────────────────────────────────────
 
-def _selenium_template(feature: FeatureChange) -> str:
-    fn = _slug(feature.path)
-    return f'''"""
-Selenium test — {feature.method} {feature.path}
-{feature.description}
-"""
-import os, pytest
-from selenium import webdriver
-from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
+def _java_class_name(path: str) -> str:
+    """'/users/{id}' → 'Users'"""
+    parts = [p for p in path.strip("/").split("/") if p and not p.startswith("{")]
+    if not parts:
+        return "Home"
+    return parts[0].capitalize()
 
-BASE_URL = os.getenv("SFCC_SITE_URL", "{BASE_URL}")
 
-@pytest.fixture
-def driver():
-    opts = Options()
-    opts.add_argument("--headless")
-    opts.add_argument("--no-sandbox")
-    opts.add_argument("--disable-dev-shm-usage")
-    d = webdriver.Chrome(options=opts)
-    yield d
-    d.quit()
-
-def test_{fn}(driver):
-    """Test {feature.path} loads correctly."""
-    driver.get(f"{{BASE_URL}}{feature.path}")
-    WebDriverWait(driver, 10).until(EC.presence_of_element_located((By.TAG_NAME, "body")))
-    assert driver.title != ""
+def _selenium_pom(group_id: str = "com.ecommerce") -> str:
+    return '''<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0
+         http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <groupId>com.ecommerce</groupId>
+    <artifactId>ecommerce-selenium</artifactId>
+    <version>1.0-SNAPSHOT</version>
+    <properties>
+        <maven.compiler.source>11</maven.compiler.source>
+        <maven.compiler.target>11</maven.compiler.target>
+        <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+        <selenium.version>4.18.1</selenium.version>
+        <testng.version>7.9.0</testng.version>
+        <webdrivermanager.version>5.7.0</webdrivermanager.version>
+    </properties>
+    <dependencies>
+        <dependency>
+            <groupId>org.seleniumhq.selenium</groupId>
+            <artifactId>selenium-java</artifactId>
+            <version>${selenium.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>io.github.bonigarcia</groupId>
+            <artifactId>webdrivermanager</artifactId>
+            <version>${webdrivermanager.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>org.testng</groupId>
+            <artifactId>testng</artifactId>
+            <version>${testng.version}</version>
+        </dependency>
+    </dependencies>
+    <build>
+        <plugins>
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-surefire-plugin</artifactId>
+                <version>3.2.5</version>
+                <configuration>
+                    <suiteXmlFiles>
+                        <suiteXmlFile>src/test/resources/testng.xml</suiteXmlFile>
+                    </suiteXmlFiles>
+                </configuration>
+            </plugin>
+        </plugins>
+    </build>
+</project>
 '''
 
 
-def _generate_selenium(feature: FeatureChange) -> str:
-    if not _openai_available():
-        return _selenium_template(feature)
+def _selenium_base_test(base_url: str) -> str:
+    return f'''package com.ecommerce.tests;
+
+import io.github.bonigarcia.wdm.WebDriverManager;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.chrome.ChromeDriver;
+import org.openqa.selenium.chrome.ChromeOptions;
+import org.testng.annotations.AfterMethod;
+import org.testng.annotations.BeforeMethod;
+
+public class BaseTest {{
+    protected WebDriver driver;
+    protected static final String BASE_URL =
+        System.getenv("SFCC_SITE_URL") != null
+            ? System.getenv("SFCC_SITE_URL")
+            : "{base_url}";
+
+    @BeforeMethod
+    public void setUp() {{
+        WebDriverManager.chromedriver().setup();
+        ChromeOptions options = new ChromeOptions();
+        options.addArguments("--headless=new");
+        options.addArguments("--no-sandbox");
+        options.addArguments("--disable-dev-shm-usage");
+        options.addArguments("--start-maximized");
+        driver = new ChromeDriver(options);
+        driver.get(BASE_URL);
+    }}
+
+    @AfterMethod
+    public void tearDown() {{
+        if (driver != null) driver.quit();
+    }}
+}}
+'''
+
+
+def _selenium_testng_xml(test_classes: list) -> str:
+    classes_xml = "\n".join(
+        f'            <class name="com.ecommerce.tests.{c}"/>'
+        for c in test_classes
+    )
+    return f'''<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE suite SYSTEM "http://testng.org/testng-1.0.dtd">
+<suite name="E-Commerce Test Suite" verbose="2">
+    <test name="All Page Tests">
+        <classes>
+{classes_xml}
+        </classes>
+    </test>
+</suite>
+'''
+
+
+def _selenium_page_template(class_name: str, feature: FeatureChange) -> str:
+    path_safe = feature.path.replace("{", "").replace("}", "")
+    return f'''package com.ecommerce.pages;
+
+import org.openqa.selenium.By;
+import org.openqa.selenium.WebDriver;
+import org.openqa.selenium.WebElement;
+import org.openqa.selenium.support.ui.ExpectedConditions;
+import org.openqa.selenium.support.ui.WebDriverWait;
+import java.time.Duration;
+
+/** Page Object for {feature.method} {feature.path} */
+public class {class_name}Page {{
+    private final WebDriver driver;
+    private final WebDriverWait wait;
+
+    // TODO: update locators to match actual page elements
+    private final By pageBody    = By.tagName("body");
+    private final By pageHeading = By.tagName("h2");
+
+    public {class_name}Page(WebDriver driver) {{
+        this.driver = driver;
+        this.wait   = new WebDriverWait(driver, Duration.ofSeconds(10));
+    }}
+
+    public boolean isPageLoaded() {{
+        return wait.until(ExpectedConditions.visibilityOfElementLocated(pageBody)).isDisplayed();
+    }}
+
+    public String getHeadingText() {{
+        try {{
+            return wait.until(ExpectedConditions.visibilityOfElementLocated(pageHeading)).getText();
+        }} catch (Exception e) {{
+            return "";
+        }}
+    }}
+}}
+'''
+
+
+def _selenium_test_template(class_name: str, feature: FeatureChange) -> str:
+    path_safe = re.sub(r'\{[^}]+\}', '1', feature.path)
+    return f'''package com.ecommerce.tests;
+
+import com.ecommerce.pages.{class_name}Page;
+import org.testng.Assert;
+import org.testng.annotations.BeforeMethod;
+import org.testng.annotations.Test;
+
+/** Tests for {feature.method} {feature.path} — {feature.description} */
+public class {class_name}Test extends BaseTest {{
+    private {class_name}Page page;
+
+    @BeforeMethod
+    public void initPage() {{
+        driver.get(BASE_URL + "{path_safe}");
+        page = new {class_name}Page(driver);
+    }}
+
+    @Test(description = "Page loads successfully")
+    public void testPageLoads() {{
+        Assert.assertTrue(page.isPageLoaded(),
+            "Page should load at {feature.path}");
+    }}
+
+    @Test(description = "Page URL is correct")
+    public void testPageUrl() {{
+        Assert.assertTrue(driver.getCurrentUrl().contains(BASE_URL),
+            "URL should contain base URL");
+    }}
+}}
+'''
+
+
+def _generate_selenium_java(feature: FeatureChange, sel_root: str,
+                             base_url: str, all_features: list = None) -> str:
+    """
+    Generate/update a Java Maven Selenium project.
+    Returns the path to the test file written.
+    """
+    class_name = _java_class_name(feature.path)
+
+    # Paths
+    test_dir  = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
+    page_dir  = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "pages")
+    res_dir   = os.path.join(sel_root, "src", "test", "resources")
+    main_dir  = os.path.join(sel_root, "src", "main", "java")
+
+    for d in [test_dir, page_dir, res_dir, main_dir]:
+        os.makedirs(d, exist_ok=True)
+
+    # pom.xml — write once
+    pom_path = os.path.join(sel_root, "pom.xml")
+    if not os.path.exists(pom_path):
+        _write(pom_path, _selenium_pom())
+
+    # BaseTest.java — write once
+    base_path = os.path.join(test_dir, "BaseTest.java")
+    if not os.path.exists(base_path):
+        _write(base_path, _selenium_base_test(base_url))
+
+    # Page object
+    page_path = os.path.join(page_dir, f"{class_name}Page.java")
+    if not os.path.exists(page_path):
+        if _openai_available():
+            content = _generate_selenium_java_ai(feature, "page", class_name)
+        else:
+            content = _selenium_page_template(class_name, feature)
+        _write(page_path, content)
+    else:
+        if _openai_available():
+            existing = open(page_path, encoding="utf-8").read()
+            content  = _update_selenium_java_ai(existing, feature, "page", class_name)
+            _write(page_path, content)
+
+    # Test class
+    test_path = os.path.join(test_dir, f"{class_name}Test.java")
+    if not os.path.exists(test_path):
+        if _openai_available():
+            content = _generate_selenium_java_ai(feature, "test", class_name)
+        else:
+            content = _selenium_test_template(class_name, feature)
+        _write(test_path, content)
+    else:
+        if _openai_available():
+            existing = open(test_path, encoding="utf-8").read()
+            content  = _update_selenium_java_ai(existing, feature, "test", class_name)
+            _write(test_path, content)
+
+    # testng.xml — regenerate to include all test classes
+    existing_tests = [
+        f.replace(".java", "")
+        for f in os.listdir(test_dir)
+        if f.endswith("Test.java") and f != "BaseTest.java"
+    ]
+    _write(os.path.join(res_dir, "testng.xml"), _selenium_testng_xml(existing_tests))
+
+    return test_path
+
+
+def _generate_selenium_java_ai(feature: FeatureChange, file_type: str,
+                                class_name: str) -> str:
+    """Generate Java Selenium Page Object or Test class via GPT."""
     try:
+        if file_type == "page":
+            prompt = f"""Write a Java Selenium Page Object class for this endpoint.
+Endpoint: {feature.method} {feature.path} — {feature.description}
+{_app_context(feature)}
+Requirements:
+- Package: com.ecommerce.pages
+- Class name: {class_name}Page
+- Use WebDriverWait (10s), By locators
+- Include isPageLoaded(), relevant element getters
+- Return ONLY Java code, no markdown fences"""
+        else:
+            path_safe = re.sub(r'\{{[^}}]+\}}', '1', feature.path)
+            prompt = f"""Write a Java TestNG Selenium test class for this endpoint.
+Endpoint: {feature.method} {feature.path} — {feature.description}
+{_app_context(feature)}
+Requirements:
+- Package: com.ecommerce.tests
+- Class name: {class_name}Test extends BaseTest
+- Import and use {class_name}Page from com.ecommerce.pages
+- BASE_URL is inherited from BaseTest
+- Navigate to BASE_URL + "{path_safe}" in @BeforeMethod
+- Test page loads, URL correct, key elements visible
+- Return ONLY Java code, no markdown fences"""
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": f"""Write a Python Selenium pytest test.
-{feature.method} {feature.path} — {feature.description}
-{_app_context(feature)}
-- os.getenv("SFCC_SITE_URL") for base URL
-- headless Chrome, WebDriverWait, assert title or element
-- function name: test_{_slug(feature.path)}
-Return ONLY Python, no fences."""}],
+            messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
         return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
-        print(f"[script_generator] GPT Selenium failed: {e} — using template")
-        return _selenium_template(feature)
+        print(f"[script_generator] GPT Java Selenium failed: {e} — using template")
+        if file_type == "page":
+            return _selenium_page_template(class_name, feature)
+        return _selenium_test_template(class_name, feature)
 
 
-def _update_selenium(existing: str, feature: FeatureChange) -> str:
+def _update_selenium_java_ai(existing: str, feature: FeatureChange,
+                              file_type: str, class_name: str) -> str:
+    """Update existing Java Selenium file via GPT."""
     if not _openai_available():
         return existing
     try:
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": f"""Update this Selenium test for modified endpoint.
+            messages=[{"role": "user", "content": f"""Update this Java Selenium {file_type} for the modified endpoint.
 {feature.method} {feature.path} — {feature.description}
-Return ONLY Python, no fences.
+Keep class structure. Return ONLY Java code, no fences.
 ---
 {existing}"""}],
             temperature=0,
         )
         return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
-        print(f"[script_generator] GPT Selenium update failed: {e}")
+        print(f"[script_generator] GPT Java update failed: {e}")
         return existing
+
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -532,26 +787,153 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
         print(f"[script_generator] CREATE loadrunner: {lr_path}")
         _write(lr_path, _generate_loadrunner(feature))
 
-    # Selenium
-    sel_path = os.path.join(root, "selenium", f"{fslug}_selenium_test.py")
+    # Selenium (Java Maven project)
+    sel_root = os.path.join(root, "selenium")
+    sel_path = _generate_selenium_java(
+        feature, sel_root,
+        base_url=os.getenv("SFCC_SITE_URL", BASE_URL),
+    )
     result.selenium_path = sel_path
-    if os.path.exists(sel_path):
-        print(f"[script_generator] UPDATE selenium: {sel_path}")
-        _write(sel_path, _update_selenium(open(sel_path, encoding="utf-8").read(), feature))
-    else:
-        print(f"[script_generator] CREATE selenium: {sel_path}")
-        _write(sel_path, _generate_selenium(feature))
 
     return result
+
+
+def _generate_lr_journey(features: List[FeatureChange], env: str, repo: str) -> None:
+    """
+    Generate ONE LoadRunner VuGen C script covering the full user journey
+    across all detected endpoints — ordered by HTTP method
+    (GET list → POST create → GET by id → PUT update → DELETE).
+    """
+    root     = _script_root(repo, env)
+    lr_dir   = os.path.join(root, "loadrunner")
+    os.makedirs(lr_dir, exist_ok=True)
+    path     = os.path.join(lr_dir, "full_journey_lr_test.c")
+
+    # Sort: GETs first, then POSTs, PUTs, DELETEs
+    order = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 2, "DELETE": 3}
+    sorted_features = sorted(features, key=lambda f: (order.get(f.method.upper(), 9), f.path))
+
+    if _openai_available():
+        try:
+            endpoints_desc = "\n".join(
+                f"  {f.method} {f.path} — {f.description}" for f in sorted_features
+            )
+            resp = client.chat.completions.create(
+                model=OPENAI_MODEL,
+                messages=[{"role": "user", "content": f"""Write ONE LoadRunner VuGen C script (.c file) covering the full user journey.
+Repo: {repo}
+Base URL: {os.getenv('SFCC_SITE_URL', 'http://localhost:8000')}
+Endpoints (in order):
+{endpoints_desc}
+
+Requirements:
+- Single Action() function covering ALL endpoints in sequence
+- Use web_reg_save_param() to correlate IDs between steps (e.g. capture user_id from POST /users, use in GET /users/{{user_id}})
+- lr_start_transaction / lr_end_transaction with LR_AUTO for each step
+- web_url() for GET, web_custom_request() for POST/PUT/PATCH/DELETE
+- lr_eval_string("{{SFCC_SITE_URL}}") for base URL
+- lr_think_time(1) between steps
+- Include vuser_init(), Action(), vuser_end()
+- Return ONLY valid C code, no markdown fences"""}],
+                temperature=0.2,
+            )
+            content = _strip_fences(resp.choices[0].message.content.strip())
+        except Exception as e:
+            print(f"[script_generator] GPT LR journey failed: {e} — using template")
+            content = _lr_journey_template(sorted_features)
+    else:
+        content = _lr_journey_template(sorted_features)
+
+    action = "UPDATE" if os.path.exists(path) else "CREATE"
+    print(f"[script_generator] {action} LR journey: {path}")
+    _write(path, content)
+
+
+def _lr_journey_template(features: List[FeatureChange]) -> str:
+    """Fallback template for full journey LR script."""
+    transactions = []
+    for f in features:
+        slug     = f"{f.method}_{_slug(f.path)}"
+        path_val = re.sub(r'\{[^}]+\}', '1', f.path)
+        method   = f.method.upper()
+        if method in ("POST", "PUT", "PATCH"):
+            req = (f'\tweb_custom_request("{slug}",\n'
+                   f'\t\t"URL={{{{SFCC_SITE_URL}}}}{path_val}",\n'
+                   f'\t\t"Method={method}",\n'
+                   f'\t\t"EncType=application/json",\n'
+                   f'\t\t"Body={{}}",\n'
+                   f'\t\tLAST);')
+        elif method == "DELETE":
+            req = (f'\tweb_custom_request("{slug}",\n'
+                   f'\t\t"URL={{{{SFCC_SITE_URL}}}}{path_val}",\n'
+                   f'\t\t"Method=DELETE",\n'
+                   f'\t\tLAST);')
+        else:
+            req = (f'\tweb_url("{slug}",\n'
+                   f'\t\t"URL={{{{SFCC_SITE_URL}}}}{path_val}",\n'
+                   f'\t\t"Resource=0",\n'
+                   f'\t\tLAST);')
+        transactions.append(
+            f'\tlr_start_transaction("{slug}");\n{req}\n'
+            f'\tlr_end_transaction("{slug}", LR_AUTO);\n\tlr_think_time(1);'
+        )
+
+    body = "\n\n".join(transactions)
+    return f'''/*
+ * LoadRunner VuGen C — Full User Journey
+ * Covers: {", ".join(f.path for f in features)}
+ * Generated by AI Performance Agent
+ */
+#ifndef _GLOBALS_H
+    #include "globals.h"
+#endif
+
+vuser_init()
+{{
+    web_set_sockets_option("SSL_VERSION", "TLS");
+    return 0;
+}}
+
+Action()
+{{
+{body}
+    return 0;
+}}
+
+vuser_end()
+{{
+    lr_log_message("Journey complete");
+    return 0;
+}}
+'''
+
+
+def _is_meaningful_path(path: str) -> bool:
+    """Filter out paths that produce no useful slug — e.g. '/', '/{id}' only."""
+    slug = re.sub(r'[^a-z0-9]+', '_', path.lower()).strip('_')
+    # Remove pure param slugs like 'id', 'user_id', 'product_id'
+    slug = re.sub(r'^(id|[a-z]+_id)$', '', slug)
+    return len(slug) >= 3
 
 
 def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = "") -> List[GeneratedScripts]:
     """
     Generate/update scripts for all features.
-    Folders are created automatically — no pre-existing structure needed.
+    Skips paths that produce no meaningful slug (e.g. '/', '/{id}').
+    Also generates one combined LoadRunner journey script for all features.
     """
     results = []
-    for feature in features:
+    meaningful = [f for f in features if _is_meaningful_path(f.path)]
+    skipped    = len(features) - len(meaningful)
+    if skipped:
+        print(f"[script_generator] Skipped {skipped} features with no meaningful path slug")
+
+    for feature in meaningful:
         print(f"[script_generator] {feature.method} {feature.path} → repo={repo or 'default'} env={env}")
         results.append(generate_scripts(feature, env, repo))
+
+    # Generate one combined LoadRunner journey script covering all endpoints
+    if meaningful:
+        _generate_lr_journey(meaningful, env, repo)
+
     return results
