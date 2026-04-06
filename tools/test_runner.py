@@ -97,8 +97,12 @@ def _ai_fix(script_path, error, script_type):
 
 # k6 runners
 def _run_k6_docker(path):
-    target = SFCC_SITE_URL or "https://test.k6.io"
+    import re as _re
+    sfcc = SFCC_SITE_URL or "https://test.k6.io"
+    # Docker containers can't resolve sibling service names — use host.docker.internal
+    target = _re.sub(r'http://[a-z][a-z0-9_-]*:', 'http://host.docker.internal:', sfcc)
     cmd = ["docker", "run", "--rm",
+           "--add-host=host.docker.internal:host-gateway",
            "-e", f"SFCC_SITE_URL={target}",
            "-v", f"{os.path.abspath(path)}:/script.js:ro",
            "grafana/k6", "run",
@@ -156,9 +160,13 @@ def run_k6_script(path):
 
 # Selenium Java/Maven runners
 def _run_maven_docker(project_root):
+    import re as _re
+    sfcc = SFCC_SITE_URL or ""
+    target = _re.sub(r'http://[a-z][a-z0-9_-]*:', 'http://host.docker.internal:', sfcc)
     abs_root = os.path.abspath(project_root)
     cmd = ["docker", "run", "--rm", "--shm-size=2g",
-           "-e", f"SFCC_SITE_URL={SFCC_SITE_URL}",
+           "--add-host=host.docker.internal:host-gateway",
+           "-e", f"SFCC_SITE_URL={target}",
            "-v", f"{abs_root}:/project", "-w", "/project",
            "maven:3.9-eclipse-temurin-11",
            "bash", "-c",

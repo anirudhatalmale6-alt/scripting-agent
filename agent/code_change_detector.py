@@ -179,14 +179,20 @@ def _parse_dependency_diff(filename: str, diff_text: str) -> List[DependencyChan
     return changes
 
 
+def _extract_router_prefix(diff_text: str) -> str:
+    """Extract APIRouter prefix from file content e.g. prefix="/users" → '/users'"""
+    m = re.search(r'APIRouter\s*\([^)]*prefix\s*=\s*["\']([^"\']+)["\']', diff_text)
+    return m.group(1).rstrip("/") if m else ""
+
+
 def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
     """
     Scan added lines (+) in a diff for new route decorators.
-    Works on both raw diff text (lines starting with +) and plain source.
-    Falls back to GPT when patterns find nothing and OpenAI is configured.
+    Handles FastAPI APIRouter prefix so POST "/" in users.py → POST /users/
+    Falls back to GPT when patterns find nothing.
     """
     changes: List[FeatureChange] = []
-    seen: set = set()  # deduplicate (method, path) pairs
+    seen: set = set()
 
     # Support both raw diff (+line) and plain source code
     added_lines = "\n".join(
@@ -195,16 +201,26 @@ def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
         if not line.startswith('---') and not line.startswith('+++')
     )
 
+    # Extract router prefix (FastAPI/Flask blueprint prefix)
+    prefix = _extract_router_prefix(diff_text) or _extract_router_prefix(added_lines)
+
     for pattern in ROUTE_PATTERNS:
         for m in re.finditer(pattern, added_lines, re.MULTILINE | re.IGNORECASE):
             groups = m.groups()
             if len(groups) == 2:
                 method, path = groups[0], groups[1]
             else:
-                # Single-group patterns (Django path, FastAPI api_route)
                 method, path = "GET", groups[0]
 
             method = method.upper()
+
+            # Prepend router prefix if path is relative (e.g. "/" → "/users/")
+            if prefix and not path.startswith(prefix):
+                path = prefix + ("" if path.startswith("/") else "/") + path.lstrip("/")
+
+            # Normalise double slashes
+            path = re.sub(r'/+', '/', path)
+
             key = (method, path)
             if key in seen:
                 continue

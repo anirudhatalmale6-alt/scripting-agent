@@ -33,6 +33,9 @@ from slack_service import send_slack
 
 load_dotenv()
 
+from agent.log_filter import setup_log_filter
+setup_log_filter()
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 _log_file = os.path.join("logs", f"test_trigger_{datetime.now().strftime('%Y%m%d')}.log")
@@ -284,24 +287,27 @@ if __name__ == "__main__":
         all_features = _deduplicate_features(all_features)
         log.info(f"[startup] After dedup: {len(all_features)} unique endpoints to generate")
 
-        # ── Step 2: check which scripts are missing on disk ───────────────────
+        # ── Step 2: check which scripts are missing on disk ─────────────────
+        # LR is one journey file, k6 and selenium are per-endpoint
+        lr_journey = os.path.join(lr_dir, "full_journey_lr_test.c")
         missing = []
         for feat in all_features:
-            slug = _slug(feat.path)
-            k6_path  = os.path.join(k6_dir,  f"{slug}_perf_test.js")
-            lr_path  = os.path.join(lr_dir,  f"{slug}_lr_test.c")
-            sel_path = os.path.join(sel_dir, f"{slug}_selenium_test.py")
-            # Generate if ANY of the 3 script types is missing
-            if not os.path.exists(k6_path) or \
-               not os.path.exists(lr_path) or \
-               not os.path.exists(sel_path):
+            slug     = _slug(feat.path)
+            k6_path  = os.path.join(k6_dir, f"{slug}_perf_test.js")
+            sel_test = os.path.join(sel_dir, "src", "test", "java", "com",
+                                    "ecommerce", "tests",
+                                    f"{feat.path.strip('/').split('/')[0].capitalize()}Test.java")
+            if not os.path.exists(k6_path) or not os.path.exists(sel_test):
                 missing.append(feat)
 
-        existing_count = len(all_features) - len(missing)
-        log.info(f"[startup] {existing_count}/{len(all_features)} scripts exist, "
-                 f"{len(missing)} need generating")
+        # Also check journey LR script
+        lr_missing = not os.path.exists(lr_journey)
 
-        if not missing:
+        existing_count = len(all_features) - len(missing)
+        log.info(f"[startup] {existing_count}/{len(all_features)} endpoint scripts exist, "
+                 f"{len(missing)} need generating, LR journey: {'exists' if not lr_missing else 'missing'}")
+
+        if not missing and not lr_missing:
             log.info("[startup] All scripts present — bootstrapping checkpoint")
             # Also register any manually added scripts not in commit history
             all_existing = (
@@ -323,16 +329,26 @@ if __name__ == "__main__":
             return
 
         # ── Step 3: generate only missing scripts ─────────────────────────────
-        log.info(f"[startup] Generating {len(missing)} missing script sets...")
+        log.info(f"[startup] Generating {len(missing)} missing endpoint scripts"
+                 + (" + LR journey" if lr_missing else "") + "...")
         created = []
         for feat in missing:
             try:
                 gs = generate_scripts(feat, env=env, repo=GITHUB_REPO)
-                created += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+                created += [gs.k6_path, gs.selenium_path]
                 log.info(f"[startup] Generated: {feat.method} {feat.path}")
             except Exception as e:
                 log.error(f"[startup] Failed to generate {feat.path}: {e}")
 
+        # Generate LR journey if missing (covers all endpoints in one script)
+        if lr_missing and all_features:
+            try:
+                from agent.script_generator import _generate_lr_journey
+                _generate_lr_journey(all_features, env=env, repo=GITHUB_REPO)
+                created.append(lr_journey)
+                log.info(f"[startup] Generated LR journey: {lr_journey}")
+            except Exception as e:
+                log.error(f"[startup] Failed to generate LR journey: {e}")
         # Also pick up any manually added scripts beyond what commits detected
         all_existing = (
             glob.glob(os.path.join(k6_dir,  "**/*.js"),  recursive=True) +

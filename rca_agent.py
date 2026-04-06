@@ -37,6 +37,9 @@ from slack_service import send_slack
 
 load_dotenv()
 
+from agent.log_filter import setup_log_filter
+setup_log_filter()
+
 # ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 _log_file = os.path.join("logs", f"rca_agent_{datetime.now().strftime('%Y%m%d')}.log")

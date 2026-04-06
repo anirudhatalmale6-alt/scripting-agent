@@ -31,6 +31,10 @@ from flask import Flask, jsonify, request
 
 load_dotenv()
 
+from agent.log_filter import setup_log_filter
+setup_log_filter()
+
+# ── Logging ───────────────────────────────────────────────────────────────────
 os.makedirs("logs", exist_ok=True)
 _log_file = os.path.join("logs", f"mcp_server_{datetime.now().strftime('%Y%m%d')}.log")
 logging.basicConfig(

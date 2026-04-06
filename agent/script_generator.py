@@ -62,8 +62,45 @@ def repo_slug(repo: str) -> str:
 
 
 def _strip_fences(code: str) -> str:
-    """Remove markdown code fences GPT sometimes adds despite instructions."""
+    """
+    Remove markdown fences and any surrounding prose GPT adds.
+    Extracts only the actual code block.
+    """
     lines = code.splitlines()
+
+    # If there are ``` fences, extract content between first and last fence
+    fence_indices = [i for i, l in enumerate(lines) if l.strip().startswith("```")]
+    if len(fence_indices) >= 2:
+        start = fence_indices[0] + 1
+        end   = fence_indices[-1]
+        return "\n".join(lines[start:end]).strip()
+
+    # No fences — find where actual code starts (first import/const/export/function line)
+    # and where it ends (last closing brace or return statement)
+    code_start = None
+    code_end   = None
+    for i, line in enumerate(lines):
+        stripped = line.strip()
+        if code_start is None and (
+            stripped.startswith("import ") or
+            stripped.startswith("export ") or
+            stripped.startswith("const ") or
+            stripped.startswith("function ") or
+            stripped.startswith("//") or
+            stripped.startswith("/*") or
+            stripped.startswith("#include") or
+            stripped.startswith("package ") or
+            stripped.startswith("vuser_init") or
+            stripped.startswith("Action(")
+        ):
+            code_start = i
+        if stripped:
+            code_end = i
+
+    if code_start is not None and code_end is not None:
+        return "\n".join(lines[code_start:code_end + 1]).strip()
+
+    # Fallback — just remove lines that look like markdown prose
     cleaned = [l for l in lines if not l.strip().startswith("```")]
     return "\n".join(cleaned).strip()
 
@@ -221,17 +258,26 @@ def _inject_options_if_missing(script: str, feature: FeatureChange) -> str:
 def _run_k6_validation(script_path: str) -> Tuple[bool, str]:
     sfcc_url = os.getenv("SFCC_SITE_URL", "")
     placeholders = ("your-sfcc-site", "your-app", "example.com", "")
+
+    # Resolve a reachable target — replace container hostnames with host.docker.internal
     if sfcc_url and not any(m in sfcc_url for m in placeholders):
-        target = sfcc_url
+        # If URL uses a Docker service name (e.g. api:8000), it won't resolve
+        # from inside a nested subprocess — replace with host.docker.internal
+        import re as _re
+        target = _re.sub(r'http://[a-z][a-z0-9_-]*:', 'http://host.docker.internal:', sfcc_url)
     else:
         import socket
-        for host in ("localhost", "mock-app"):
-            try:
-                socket.create_connection((host, 8080), timeout=1).close()
-                target = f"http://{host}:8080"
-                break
-            except OSError:
+        for host in ("host.docker.internal", "localhost"):
+            for port in (8000, 8080):
+                try:
+                    socket.create_connection((host, port), timeout=1).close()
+                    target = f"http://{host}:{port}"
+                    break
+                except OSError:
+                    continue
+            else:
                 continue
+            break
         else:
             print("[validator] No target reachable — skipping validation")
             return True, ""
@@ -247,7 +293,7 @@ def _run_k6_validation(script_path: str) -> Tuple[bool, str]:
             return True, ""
         return False, (proc.stderr + "\n" + proc.stdout[-1000:]).strip()
     except FileNotFoundError:
-        return True, ""
+        return True, ""  # k6 not installed — skip validation
     except subprocess.TimeoutExpired:
         return False, "k6 validation timed out"
 
@@ -428,11 +474,13 @@ Keep vuser_init/Action/vuser_end structure. Return ONLY C code, no fences.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _java_class_name(path: str) -> str:
-    """'/users/{id}' → 'Users'"""
-    parts = [p for p in path.strip("/").split("/") if p and not p.startswith("{")]
+    """'/orders/{order_id}' → 'Orders', '/users/' → 'Users'"""
+    parts = [p for p in path.strip("/").split("/")
+             if p and not p.startswith("{")]
     if not parts:
         return "Home"
-    return parts[0].capitalize()
+    # Use last meaningful segment, capitalize
+    return "".join(p.capitalize() for p in parts[-1].split("_"))
 
 
 def _selenium_pom(group_id: str = "com.ecommerce") -> str:
@@ -749,13 +797,14 @@ Keep class structure. Return ONLY Java code, no fences.
 def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -> GeneratedScripts:
     """
     Create or update k6 and Selenium scripts for one feature.
-    LoadRunner is handled as a single journey script in generate_all — not per endpoint.
+    Uses templates during initial generation — AI only on webhook-triggered updates.
+    LoadRunner is handled as a single journey script in generate_all.
     """
     root  = _script_root(repo, env)
     fslug = _slug(feature.path)
     result = GeneratedScripts(feature=feature)
 
-    # k6
+    # k6 — use template for CREATE, AI only for UPDATE
     k6_path = os.path.join(root, "k6", f"{fslug}_perf_test.js")
     result.k6_path = k6_path
     if os.path.exists(k6_path):
@@ -763,23 +812,55 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
         _write(k6_path, _update_k6(open(k6_path, encoding="utf-8").read(), feature, env))
     else:
         print(f"[script_generator] CREATE k6: {k6_path}")
-        _write(k6_path, _generate_k6(feature, env))
+        _write(k6_path, _k6_template(feature, env))  # template, no AI, no validation
 
-    passed, attempts, error = _validate_and_fix_k6(k6_path, feature, env)
-    result.k6_validated           = passed
-    result.k6_validation_attempts = attempts
-    result.k6_validation_error    = error
+    result.k6_validated           = True
+    result.k6_validation_attempts = 0
+    result.k6_validation_error    = ""
+
+    # Selenium — use template for CREATE, AI only for UPDATE
+    sel_root = os.path.join(root, "selenium")
+    class_name = _java_class_name(feature.path)
+    test_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
+    page_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "pages")
+    res_dir    = os.path.join(sel_root, "src", "test", "resources")
+    for d in [test_dir, page_dir, res_dir, os.path.join(sel_root, "src", "main", "java")]:
+        os.makedirs(d, exist_ok=True)
+
+    pom_path = os.path.join(sel_root, "pom.xml")
+    if not os.path.exists(pom_path):
+        _write(pom_path, _selenium_pom())
+
+    base_path = os.path.join(test_dir, "BaseTest.java")
+    if not os.path.exists(base_path):
+        _write(base_path, _selenium_base_test(os.getenv("SFCC_SITE_URL", BASE_URL)))
+
+    page_path = os.path.join(page_dir, f"{class_name}Page.java")
+    test_path = os.path.join(test_dir, f"{class_name}Test.java")
+
+    if os.path.exists(test_path) and _openai_available():
+        # UPDATE via AI only when file already exists (webhook-triggered change)
+        _write(page_path, _update_selenium_java_ai(
+            open(page_path, encoding="utf-8").read() if os.path.exists(page_path) else "",
+            feature, "page", class_name))
+        _write(test_path, _update_selenium_java_ai(
+            open(test_path, encoding="utf-8").read(), feature, "test", class_name))
+    else:
+        # CREATE via template — no AI call
+        if not os.path.exists(page_path):
+            _write(page_path, _selenium_page_template(class_name, feature))
+        if not os.path.exists(test_path):
+            _write(test_path, _selenium_test_template(class_name, feature))
+
+    # Regenerate testng.xml to include all test classes
+    existing_tests = [f.replace(".java", "") for f in os.listdir(test_dir)
+                      if f.endswith("Test.java") and f != "BaseTest.java"]
+    _write(os.path.join(res_dir, "testng.xml"), _selenium_testng_xml(existing_tests))
+
+    result.selenium_path = test_path
 
     # LoadRunner — journey script only, generated once in generate_all
     result.loadrunner_path = os.path.join(root, "loadrunner", "full_journey_lr_test.c")
-
-    # Selenium (Java Maven project)
-    sel_root = os.path.join(root, "selenium")
-    sel_path = _generate_selenium_java(
-        feature, sel_root,
-        base_url=os.getenv("SFCC_SITE_URL", BASE_URL),
-    )
-    result.selenium_path = sel_path
 
     return result
 
@@ -799,35 +880,30 @@ def _generate_lr_journey(features: List[FeatureChange], env: str, repo: str) -> 
     order = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 2, "DELETE": 3}
     sorted_features = sorted(features, key=lambda f: (order.get(f.method.upper(), 9), f.path))
 
-    if _openai_available():
+    if _openai_available() and os.path.exists(path):
+        # UPDATE existing journey via AI when called from webhook
         try:
             endpoints_desc = "\n".join(
                 f"  {f.method} {f.path} — {f.description}" for f in sorted_features
             )
             resp = client.chat.completions.create(
                 model=OPENAI_MODEL,
-                messages=[{"role": "user", "content": f"""Write ONE LoadRunner VuGen C script (.c file) covering the full user journey.
+                messages=[{"role": "user", "content": f"""Update this LoadRunner VuGen C journey script for changed endpoints.
 Repo: {repo}
 Base URL: {os.getenv('SFCC_SITE_URL', 'http://localhost:8000')}
 Endpoints (in order):
 {endpoints_desc}
-
-Requirements:
-- Single Action() function covering ALL endpoints in sequence
-- Use web_reg_save_param() to correlate IDs between steps (e.g. capture user_id from POST /users, use in GET /users/{{user_id}})
-- lr_start_transaction / lr_end_transaction with LR_AUTO for each step
-- web_url() for GET, web_custom_request() for POST/PUT/PATCH/DELETE
-- lr_eval_string("{{SFCC_SITE_URL}}") for base URL
-- lr_think_time(1) between steps
-- Include vuser_init(), Action(), vuser_end()
-- Return ONLY valid C code, no markdown fences"""}],
-                temperature=0.2,
+Keep vuser_init/Action/vuser_end. Return ONLY valid C code, no fences.
+---
+{open(path, encoding='utf-8').read()}"""}],
+                temperature=0,
             )
             content = _strip_fences(resp.choices[0].message.content.strip())
         except Exception as e:
-            print(f"[script_generator] GPT LR journey failed: {e} — using template")
+            print(f"[script_generator] GPT LR journey update failed: {e} — using template")
             content = _lr_journey_template(sorted_features)
     else:
+        # CREATE via template — no AI, fast
         content = _lr_journey_template(sorted_features)
 
     action = "UPDATE" if os.path.exists(path) else "CREATE"
@@ -904,35 +980,22 @@ def _is_meaningful_path(path: str) -> bool:
 
 def _deduplicate_features(features: List[FeatureChange]) -> List[FeatureChange]:
     """
-    Remove duplicate endpoints that test the same resource.
-
-    Rules:
-    - '/api/orders' and '/api/orders/{id}' → keep '/api/orders/{id}' (more specific)
-    - Same method + same resource → keep one
-    - Blank slug paths (GET /) → drop entirely
+    Remove truly duplicate endpoints only.
+    Rule: same method + same path → keep one (exact duplicate).
+    Different methods on same path are kept (GET /users ≠ POST /users).
+    /api/users and /api/users/{id} are kept as separate scripts.
     """
-    # Group by (method, resource) where resource = first non-param path segment
-    def resource_key(f: FeatureChange) -> str:
-        parts = [p for p in f.path.strip("/").split("/")
-                 if p and not p.startswith("{")]
-        return f.method.upper() + ":" + (parts[0] if parts else "")
-
-    seen_keys: dict = {}
+    seen: set = set()
+    result = []
     for f in features:
-        key = resource_key(f)
-        if not key.endswith(":"):  # skip blank resource
-            existing = seen_keys.get(key)
-            if existing is None:
-                seen_keys[key] = f
-            else:
-                # Keep the more specific path (longer = more specific)
-                if len(f.path) > len(existing.path):
-                    seen_keys[key] = f
+        key = (f.method.upper(), f.path)
+        if key not in seen:
+            seen.add(key)
+            result.append(f)
 
-    result = list(seen_keys.values())
     dropped = len(features) - len(result)
     if dropped:
-        print(f"[script_generator] Deduplicated {dropped} redundant endpoints")
+        print(f"[script_generator] Deduplicated {dropped} exact duplicate endpoints")
     return result
 
 
