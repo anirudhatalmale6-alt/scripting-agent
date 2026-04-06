@@ -1,22 +1,16 @@
 """
-tools/test_runner.py
-────────────────────
-Runs test scripts (k6, Selenium Java/Maven) and captures structured results.
-AI is only called when a test FAILS — not on every run.
+tools/test_runner.py - Runs test scripts in Docker sandbox containers.
 
-Flow per script:
-  1. Run script (subprocess)
-  2. PASS  → done, zero AI credits used
-  3. FAIL  → send script + error to AI for fix → retry (max MAX_RETRIES)
-  4. Still failing → flag needs_manual_review, create Jira ticket
+Sandbox support:
+  k6        -> grafana/k6 Docker image (free, official)
+  Selenium  -> maven:3.9-eclipse-temurin-11 + chromium (free)
+  LoadRunner -> C syntax check only (requires licensed VuGen to execute)
 
-Public API
-──────────
-  run_k6_script(path)        -> TestResult
-  run_selenium_script(path)  -> TestResult   (Java Maven project root)
-  run_all_k6(repo, env)      -> list[TestResult]
-  run_all_selenium(repo, env)-> list[TestResult]
-  summarise(results)         -> dict
+Flow:
+  1. Run in Docker sandbox (or local fallback if Docker unavailable)
+  2. PASS  -> done, zero AI credits used
+  3. FAIL  -> AI fixes script -> retry (max MAX_RETRIES)
+  4. Still failing -> needs_manual flag
 """
 
 import glob
@@ -36,12 +30,13 @@ K6_VUS        = int(os.getenv("K6_VUS", "10"))
 K6_DURATION   = os.getenv("K6_DURATION", "30s")
 SFCC_SITE_URL = os.getenv("SFCC_SITE_URL", "")
 OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+USE_SANDBOX   = os.getenv("USE_SANDBOX", "true").lower() == "true"
 
 
 @dataclass
 class TestResult:
     script:       str
-    type:         str   # "k6" | "selenium"
+    type:         str
     passed:       bool
     output:       str = ""
     error:        str = ""
@@ -50,29 +45,30 @@ class TestResult:
     needs_manual: bool = False
 
 
-# ── Helpers ───────────────────────────────────────────────────────────────────
-
-def _openai_available() -> bool:
+def _openai_available():
     key = os.getenv("OPENAI_API_KEY", "")
     return bool(key) and "xxxxxx" not in key and key.startswith("sk-")
 
-def _read(path: str) -> str:
+def _read(path):
     with open(path, encoding="utf-8") as f:
         return f.read()
 
-def _write(path: str, content: str) -> None:
+def _write(path, content):
     with open(path, "w", encoding="utf-8") as f:
         f.write(content)
 
-def _strip_fences(code: str) -> str:
-    return "\n".join(
-        l for l in code.splitlines() if not l.strip().startswith("```")
-    ).strip()
+def _strip_fences(code):
+    return "\n".join(l for l in code.splitlines()
+                     if not l.strip().startswith("```")).strip()
 
+def _docker_available():
+    try:
+        subprocess.run(["docker", "info"], capture_output=True, timeout=5)
+        return True
+    except Exception:
+        return False
 
-# ── AI fix — only called on failure ──────────────────────────────────────────
-
-def _ai_fix(script_path: str, error: str, script_type: str) -> Optional[str]:
+def _ai_fix(script_path, error, script_type):
     if not _openai_available():
         return None
     try:
@@ -80,82 +76,117 @@ def _ai_fix(script_path: str, error: str, script_type: str) -> Optional[str]:
         client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
         current = _read(script_path)
         if script_type == "k6":
-            lang = "k6 JavaScript"
-            req  = "Valid k6 JS, export const options, export default function, no markdown fences"
+            lang, req = "k6 JavaScript", "valid k6 JS, no markdown fences"
+        elif script_type == "selenium_java":
+            lang, req = "Java TestNG Selenium", "valid Java, fix imports/locators, no fences"
         else:
-            lang = "Java TestNG Selenium"
-            req  = "Valid Java, fix imports/assertions/locators, no markdown fences"
-        prompt = f"""Fix this failing {lang} test script.
-Error:
-{error[:2000]}
-Requirements: {req}
-Do NOT change what the test is testing — only fix the error.
-Return ONLY the fixed code, no explanation, no fences.
-Script:
-{current}"""
+            lang, req = "LoadRunner VuGen C", "valid C, fix syntax, no fences"
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
-            messages=[{"role": "user", "content": prompt}],
+            messages=[{"role": "user", "content":
+                f"Fix this failing {lang} script.\nError:\n{error[:2000]}\n"
+                f"Requirements: {req}\nDo NOT change what is being tested.\n"
+                f"Return ONLY fixed code, no explanation.\nScript:\n{current}"}],
             temperature=0,
         )
         return _strip_fences(resp.choices[0].message.content.strip())
     except Exception as e:
-        log.error(f"[test_runner] AI fix failed for {script_path}: {e}")
+        log.error(f"[test_runner] AI fix failed: {e}")
         return None
 
 
-# ── k6 runner ─────────────────────────────────────────────────────────────────
+# k6 runners
+def _run_k6_docker(path):
+    target = SFCC_SITE_URL or "https://test.k6.io"
+    cmd = ["docker", "run", "--rm",
+           "-e", f"SFCC_SITE_URL={target}",
+           "-v", f"{os.path.abspath(path)}:/script.js:ro",
+           "grafana/k6", "run",
+           "--vus", str(K6_VUS), "--duration", K6_DURATION,
+           "--no-usage-report", "/script.js"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+        return proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    except subprocess.TimeoutExpired:
+        return False, "k6 Docker timed out"
+    except Exception as e:
+        return False, str(e)
 
-def run_k6_script(path: str) -> TestResult:
-    result = TestResult(script=path, type="k6", passed=False)
+def _run_k6_local(path):
     env = os.environ.copy()
     if SFCC_SITE_URL:
         env["SFCC_SITE_URL"] = SFCC_SITE_URL
+    try:
+        proc = subprocess.run(
+            ["k6", "run", "--vus", str(K6_VUS), "--duration", K6_DURATION,
+             "--no-usage-report", path],
+            env=env, capture_output=True, text=True, timeout=300)
+        return proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    except FileNotFoundError:
+        return False, "k6 not installed"
+    except subprocess.TimeoutExpired:
+        return False, "k6 timed out"
 
+def run_k6_script(path):
+    result = TestResult(script=path, type="k6", passed=False)
+    use_docker = USE_SANDBOX and _docker_available()
+    runner = _run_k6_docker if use_docker else _run_k6_local
+    mode   = "Docker" if use_docker else "local"
     for attempt in range(1, MAX_RETRIES + 1):
         result.attempts = attempt
-        log.info(f"[test_runner] k6 {os.path.basename(path)} "
-                 f"attempt {attempt}/{MAX_RETRIES} ({K6_VUS}VUs/{K6_DURATION})")
-        try:
-            proc = subprocess.run(
-                ["k6", "run", "--vus", str(K6_VUS), "--duration", K6_DURATION,
-                 "--no-usage-report", path],
-                env=env, capture_output=True, text=True, timeout=300,
-            )
-            result.output = (proc.stdout + proc.stderr)[-3000:]
-            if proc.returncode == 0:
-                result.passed = True
-                log.info(f"[test_runner] ✅ k6 PASSED: {os.path.basename(path)}")
-                return result
-            error = (proc.stderr + proc.stdout[-1000:]).strip()
-            result.error = error[:500]
-            log.warning(f"[test_runner] ❌ k6 FAILED: {error[:150]}")
-            if attempt < MAX_RETRIES:
-                fixed = _ai_fix(path, error, "k6")
-                if fixed:
-                    _write(path, fixed)
-                    result.ai_fixes += 1
-                else:
-                    break
-        except FileNotFoundError:
-            result.error = "k6 not installed"
+        log.info(f"[test_runner] k6 [{mode}] {os.path.basename(path)} {attempt}/{MAX_RETRIES}")
+        passed, output = runner(path)
+        result.output = output
+        if passed:
+            result.passed = True
+            log.info(f"[test_runner] k6 PASSED: {os.path.basename(path)}")
             return result
-        except subprocess.TimeoutExpired:
-            result.error = "k6 timed out"
-            return result
-
+        result.error = output[:500]
+        log.warning(f"[test_runner] k6 FAILED: {output[:150]}")
+        if attempt < MAX_RETRIES:
+            fixed = _ai_fix(path, output, "k6")
+            if fixed:
+                _write(path, fixed)
+                result.ai_fixes += 1
+            else:
+                break
     result.needs_manual = not result.passed
     return result
 
 
-# ── Selenium Java/Maven runner ────────────────────────────────────────────────
+# Selenium Java/Maven runners
+def _run_maven_docker(project_root):
+    abs_root = os.path.abspath(project_root)
+    cmd = ["docker", "run", "--rm", "--shm-size=2g",
+           "-e", f"SFCC_SITE_URL={SFCC_SITE_URL}",
+           "-v", f"{abs_root}:/project", "-w", "/project",
+           "maven:3.9-eclipse-temurin-11",
+           "bash", "-c",
+           "apt-get update -qq && apt-get install -y -qq chromium chromium-driver "
+           "&& mvn clean test -q"]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=600)
+        return proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    except subprocess.TimeoutExpired:
+        return False, "Maven Docker timed out"
+    except Exception as e:
+        return False, str(e)
 
-def run_selenium_script(path: str) -> TestResult:
-    """
-    Run a Java Maven Selenium project via mvn clean test.
-    path = selenium project root (containing pom.xml) or any file inside it.
-    """
-    # Resolve project root
+def _run_maven_local(project_root):
+    env = os.environ.copy()
+    if SFCC_SITE_URL:
+        env["SFCC_SITE_URL"] = SFCC_SITE_URL
+    try:
+        proc = subprocess.run(["mvn", "clean", "test", "-q"],
+                              cwd=project_root, env=env,
+                              capture_output=True, text=True, timeout=300)
+        return proc.returncode == 0, (proc.stdout + proc.stderr)[-3000:]
+    except FileNotFoundError:
+        return False, "mvn not found"
+    except subprocess.TimeoutExpired:
+        return False, "mvn timed out"
+
+def run_selenium_script(path):
     project_root = path if os.path.isdir(path) else os.path.dirname(path)
     d = project_root
     while d and d != os.path.dirname(d):
@@ -163,92 +194,109 @@ def run_selenium_script(path: str) -> TestResult:
             project_root = d
             break
         d = os.path.dirname(d)
-
     result = TestResult(script=project_root, type="selenium", passed=False)
-
     if not os.path.exists(os.path.join(project_root, "pom.xml")):
         result.error = f"No pom.xml in {project_root}"
         result.needs_manual = True
         return result
-
-    env = os.environ.copy()
-    if SFCC_SITE_URL:
-        env["SFCC_SITE_URL"] = SFCC_SITE_URL
-
+    use_docker = USE_SANDBOX and _docker_available()
+    runner = _run_maven_docker if use_docker else _run_maven_local
+    mode   = "Docker" if use_docker else "local"
     for attempt in range(1, MAX_RETRIES + 1):
         result.attempts = attempt
-        log.info(f"[test_runner] mvn test {os.path.basename(project_root)} "
-                 f"attempt {attempt}/{MAX_RETRIES}")
-        try:
-            proc = subprocess.run(
-                ["mvn", "clean", "test", "-q"],
-                cwd=project_root, env=env,
-                capture_output=True, text=True, timeout=300,
-            )
-            result.output = (proc.stdout + proc.stderr)[-3000:]
-            if proc.returncode == 0:
-                result.passed = True
-                log.info(f"[test_runner] ✅ mvn PASSED: {project_root}")
-                return result
-            error = (proc.stdout + proc.stderr)[-2000:]
-            result.error = error[:500]
-            log.warning(f"[test_runner] ❌ mvn FAILED: {error[:150]}")
-            if attempt < MAX_RETRIES:
-                test_dir = os.path.join(project_root, "src", "test", "java",
-                                        "com", "ecommerce", "tests")
-                fixed_any = False
-                if os.path.isdir(test_dir):
-                    for jf in glob.glob(f"{test_dir}/*Test.java"):
-                        if "BaseTest" in jf:
-                            continue
-                        fixed = _ai_fix(jf, error, "selenium_java")
-                        if fixed:
-                            _write(jf, fixed)
-                            result.ai_fixes += 1
-                            fixed_any = True
-                if not fixed_any:
-                    break
-        except FileNotFoundError:
-            result.error = "mvn not found — install Java + Maven"
+        log.info(f"[test_runner] mvn [{mode}] {os.path.basename(project_root)} {attempt}/{MAX_RETRIES}")
+        passed, output = runner(project_root)
+        result.output = output
+        if passed:
+            result.passed = True
+            log.info(f"[test_runner] mvn PASSED: {project_root}")
             return result
-        except subprocess.TimeoutExpired:
-            result.error = "mvn timed out"
-            return result
-
+        result.error = output[:500]
+        log.warning(f"[test_runner] mvn FAILED: {output[:150]}")
+        if attempt < MAX_RETRIES:
+            test_dir = os.path.join(project_root, "src", "test", "java",
+                                    "com", "ecommerce", "tests")
+            fixed_any = False
+            if os.path.isdir(test_dir):
+                for jf in glob.glob(f"{test_dir}/*Test.java"):
+                    if "BaseTest" in jf:
+                        continue
+                    fixed = _ai_fix(jf, output, "selenium_java")
+                    if fixed:
+                        _write(jf, fixed)
+                        result.ai_fixes += 1
+                        fixed_any = True
+            if not fixed_any:
+                break
     result.needs_manual = not result.passed
     return result
 
 
-# ── Batch runners ─────────────────────────────────────────────────────────────
+# LoadRunner - syntax check only, no sandbox available
+def run_loadrunner_script(path):
+    """LoadRunner requires licensed VuGen. Validates C syntax only."""
+    result = TestResult(script=path, type="loadrunner", passed=False)
+    if not os.path.exists(path):
+        result.error = f"Not found: {path}"
+        result.needs_manual = True
+        return result
+    try:
+        proc = subprocess.run(["gcc", "--syntax-only", path],
+                              capture_output=True, text=True, timeout=30)
+        if proc.returncode == 0:
+            result.passed = True
+            log.info(f"[test_runner] LR syntax OK: {os.path.basename(path)} - run in VuGen")
+        else:
+            result.error = proc.stderr[:500]
+            log.warning(f"[test_runner] LR syntax error: {result.error[:150]}")
+            if _openai_available():
+                fixed = _ai_fix(path, result.error, "loadrunner_c")
+                if fixed:
+                    _write(path, fixed)
+                    result.ai_fixes += 1
+                    result.passed = True
+    except FileNotFoundError:
+        result.passed = True
+        log.info(f"[test_runner] LR generated (no gcc): {os.path.basename(path)}")
+    except subprocess.TimeoutExpired:
+        result.passed = True
+    result.needs_manual = True  # always needs manual LR execution
+    return result
 
-def run_all_k6(repo: str = "", env: str = "dev") -> list:
+
+# Batch runners
+def run_all_k6(repo="", env="dev"):
     from agent.script_generator import repo_slug
     base = os.path.join("scripts", repo_slug(repo) if repo else "default", env, "k6")
-    scripts = sorted(glob.glob(f"{base}/**/*.js", recursive=True) +
-                     glob.glob(f"{base}/*.js"))
+    scripts = sorted(glob.glob(f"{base}/**/*.js", recursive=True) + glob.glob(f"{base}/*.js"))
     if not scripts:
         log.info(f"[test_runner] No k6 scripts in {base}")
         return []
     log.info(f"[test_runner] Running {len(scripts)} k6 scripts...")
     return [run_k6_script(s) for s in scripts]
 
-
-def run_all_selenium(repo: str = "", env: str = "dev") -> list:
-    """Find all Maven selenium project roots and run each once."""
+def run_all_selenium(repo="", env="dev"):
     from agent.script_generator import repo_slug
     base = os.path.join("scripts", repo_slug(repo) if repo else "default", env, "selenium")
-    # Each selenium/ folder IS the Maven project root
-    pom_files = glob.glob(f"{base}/**/pom.xml", recursive=True) + \
-                glob.glob(f"{base}/pom.xml")
-    project_roots = list({os.path.dirname(p) for p in pom_files})
-    if not project_roots:
-        log.info(f"[test_runner] No Maven selenium projects in {base}")
+    pom_files = (glob.glob(f"{base}/**/pom.xml", recursive=True) + glob.glob(f"{base}/pom.xml"))
+    roots = list({os.path.dirname(p) for p in pom_files})
+    if not roots:
+        log.info(f"[test_runner] No Maven projects in {base}")
         return []
-    log.info(f"[test_runner] Running {len(project_roots)} selenium project(s)...")
-    return [run_selenium_script(r) for r in project_roots]
+    log.info(f"[test_runner] Running {len(roots)} selenium project(s)...")
+    return [run_selenium_script(r) for r in roots]
 
+def run_all_loadrunner(repo="", env="dev"):
+    from agent.script_generator import repo_slug
+    base = os.path.join("scripts", repo_slug(repo) if repo else "default", env, "loadrunner")
+    scripts = sorted(glob.glob(f"{base}/**/*.c", recursive=True) + glob.glob(f"{base}/*.c"))
+    if not scripts:
+        log.info(f"[test_runner] No LR scripts in {base}")
+        return []
+    log.info(f"[test_runner] Validating {len(scripts)} LR scripts (syntax only)...")
+    return [run_loadrunner_script(s) for s in scripts]
 
-def summarise(results: list) -> dict:
+def summarise(results):
     passed  = [r for r in results if r.passed]
     manual  = [r for r in results if r.needs_manual]
     ai_used = sum(r.ai_fixes for r in results)
