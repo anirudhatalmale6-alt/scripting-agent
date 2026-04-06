@@ -1,8 +1,6 @@
 from flask import Flask, request, jsonify
 import requests
 import os
-import logging
-from datetime import datetime
 from dotenv import load_dotenv
 from openai import OpenAI
 from email_service import send_email
@@ -15,28 +13,12 @@ import threading
 import sys
 import traceback
 import gc
+# from email_service import connect, send_email
+from tools.openspec import get_tools
 
-# ── NEW: smart code-change detection + script generation/patching ─────────────
-from agent.test_orchestrator import orchestrate
-from agent.concurrency import WebhookQueue
-from report_writer import write_report
-
-# Single queue — serialises all concurrent webhook events
-_webhook_queue = WebhookQueue()
-
-# ── File logging setup ────────────────────────────────────────────────────────
-os.makedirs("logs", exist_ok=True)
-_log_file = os.path.join("logs", f"agent_{datetime.now().strftime('%Y%m%d')}.log")
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[
-        logging.FileHandler(_log_file, encoding="utf-8"),
-        logging.StreamHandler(),          # keep console output too
-    ],
-)
-log = logging.getLogger("agent")
-log.info(f"Agent log file: {_log_file}")
+import hmac
+import hashlib
+import os
 
 # --------------------------------
 # LOAD ENV VARIABLES
@@ -44,6 +26,7 @@ log.info(f"Agent log file: {_log_file}")
 
 load_dotenv()
 
+GITHUB_SECRET = os.getenv("GITHUB_SECRET")
 MCP_URL = os.getenv("MCP_URL")
 TOKEN = os.getenv("TOKEN")
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
@@ -61,15 +44,27 @@ JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
 
 client = OpenAI(api_key=OPENAI_API_KEY)
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 ENABLE_AI = os.getenv("ENABLE_AI", "true")
 GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
+
 # --------------------------------
 # FLASK APP
 # --------------------------------
 
 app = Flask(__name__)
+
+def verify_signature(payload, signature):
+
+    mac = hmac.new(
+        GITHUB_SECRET.encode(),
+        payload,
+        hashlib.sha256
+    )
+
+    expected = "sha256=" + mac.hexdigest()
+
+    return hmac.compare_digest(expected, signature)
 
 def get_system_metrics():
     return {
@@ -266,10 +261,58 @@ def extract_anomalies(perf):
 # --------------------------------
 
 def run_k6():
-    # Delegate to tools/k6.py which handles subprocess, timeouts,
-    # Grafana remote-write, and graceful error handling properly.
-    from tools.k6 import run_k6_test
-    return run_k6_test()
+
+    try:
+
+        print("\nRunning k6 performance tests\n")
+
+        # Set Grafana remote write environment variables
+        os.environ["K6_PROMETHEUS_RW_SERVER_URL"] = GRAFANA_RW_URL
+        os.environ["K6_PROMETHEUS_RW_USERNAME"] = GRAFANA_USERNAME
+        os.environ["K6_PROMETHEUS_RW_PASSWORD"] = GRAFANA_API_KEY
+
+        # Target website
+        os.environ["SFCC_SITE_URL"] = SFCC_SITE_URL
+
+        print("Testing SFCC site:", SFCC_SITE_URL)
+
+        # Find all k6 scripts in scripts folders
+        scripts = glob.glob("scripts/**/*.js", recursive=True)
+
+        if not scripts:
+            print("No k6 scripts found in scripts folder")
+            return {"status": "no scripts found"}
+
+        results = []
+
+        for script in scripts:
+
+            print("\n-----------------------------------")
+            print("Running k6 script:", script)
+            print("-----------------------------------\n")
+
+            cmd = f'k6 run -o experimental-prometheus-rw {script}'
+
+            exit_code = os.system(cmd)
+
+            results.append({
+                "script": script,
+                "exit_code": exit_code
+            })
+
+        print("\nAll k6 scripts executed\n")
+
+        return {
+            "status": "completed",
+            "scripts_run": len(results),
+            "results": results
+        }
+
+    except Exception as e:
+
+        print("k6 Error:", str(e))
+
+        return {"error": str(e)}
 
 
 # --------------------------------
@@ -291,38 +334,66 @@ def run_tests():
         "speedcurve": speedcurve,
         "datadog": datadog
     }
-
 def get_git_diff():
-
     try:
-        url = f"{GITHUB_REPO_URL}/commits"
+        print("\n🔍 Fetching GitHub commits...\n")
 
         headers = {
-            "Authorization": f"Bearer {GITHUB_TOKEN}"
+            "Authorization": f"token {GITHUB_TOKEN}"
         }
 
-        response = requests.get(url, headers=headers)
-        commits = response.json()
+        # Step 1: Get commits
+        commits_url = f"{GITHUB_REPO_URL}/commits"
+        res = requests.get(commits_url, headers=headers)
 
-        if not commits:
-            return {}
+        print("📡 Commits API Status:", res.status_code)
+
+        commits = res.json()
+
+        if not commits or "message" in commits:
+            print("❌ No commits found or access denied")
+            return {"error": "No commits found"}
 
         latest_commit = commits[0]["sha"]
 
-        diff_url = f"{GITHUB_REPO_URL}/commits/{latest_commit}"
+        print("✅ Latest Commit:", latest_commit)
 
+        # Step 2: Get diff
+        diff_url = f"{GITHUB_REPO_URL}/commits/{latest_commit}"
         diff_res = requests.get(diff_url, headers=headers)
+
+        print("📡 Diff API Status:", diff_res.status_code)
+
         diff_data = diff_res.json()
 
         files = diff_data.get("files", [])
 
+        if not files:
+            print("⚠️ No file changes found (maybe first commit)")
+        
         changes = []
 
+        print("\n📂 Changed Files:\n")
+
         for f in files:
+            filename = f.get("filename")
+            change_count = f.get("changes")
+            patch = f.get("patch", "")
+
+            print(f"📄 File: {filename}")
+            print(f"🔢 Changes: {change_count}")
+
+            if patch:
+                print("🧾 Patch Preview:\n", patch[:300])
+            else:
+                print("⚠️ No patch available")
+
+            print("-" * 50)
+
             changes.append({
-                "filename": f.get("filename"),
-                "changes": f.get("changes"),
-                "patch": f.get("patch", "")[:200]
+                "filename": filename,
+                "changes": change_count,
+                "patch": patch[:300]
             })
 
         return {
@@ -331,6 +402,7 @@ def get_git_diff():
         }
 
     except Exception as e:
+        print("❌ Git Diff Error:", str(e))
         return {"error": str(e)}
 # --------------------------------
 # ROOT CAUSE DATA
@@ -348,7 +420,6 @@ def run_rca():
         "commits": commits,
         "git_diff": git_diff
     }
-
 
 
 def create_jira_ticket(summary, description):
@@ -370,9 +441,27 @@ def create_jira_ticket(summary, description):
                     "key": JIRA_PROJECT_KEY
                 },
                 "summary": summary,
-                "description": description,
+
+                # ✅ FIXED DESCRIPTION (ADF FORMAT)
+                "description": {
+                    "type": "doc",
+                    "version": 1,
+                    "content": [
+                        {
+                            "type": "paragraph",
+                            "content": [
+                                {
+                                    "type": "text",
+                                    "text": description
+                                }
+                            ]
+                        }
+                    ]
+                },
+
+                # ✅ SAFEST ISSUE TYPE
                 "issuetype": {
-                    "name": "Bug"
+                    "name": "Task"
                 }
             }
         }
@@ -389,12 +478,12 @@ def create_jira_ticket(summary, description):
         return response.json()
 
     except Exception as e:
-
         print("JIRA Error:", str(e))
         return {"error": str(e)}
-# --------------------------------
-# AI ROOT CAUSE ANALYSIS
-# --------------------------------
+
+# # --------------------------------
+# # AI ROOT CAUSE ANALYSIS
+# # --------------------------------
 
 def ai_analysis(data):
 
@@ -422,7 +511,7 @@ Performance Data:
 
         response = client.chat.completions.create(
 
-            model=OPENAI_MODEL,
+            model="gpt-4o-mini",
 
             messages=[
                 {
@@ -449,13 +538,95 @@ Performance Data:
 
         print("AI Error:", str(e))
         return {"error": str(e)}
+# --------------------------------
+# AI ROOT CAUSE ANALYSIS (OLLAMA + OPENSPEC)
+# --------------------------------
 
+# def ai_analysis(data):
 
+#     try:
+#         import requests
+#         from tools.openspec import get_tools
+
+#         print("\nRunning AI Root Cause Analysis (Ollama + OpenSpec)\n")
+
+#         # Load tools (OpenSpec)
+#         tools = get_tools()
+
+#         # Dynamic config (from .env)
+#         OLLAMA_URL = os.getenv("OLLAMA_URL", "http://localhost:11434")
+#         OLLAMA_MODEL = os.getenv("OLLAMA_MODEL", "llama3")
+
+#         # Prompt
+#         prompt = f"""
+# You are a performance engineer.
+
+# You have access to the following tools:
+# {tools}
+
+# Analyze system data.
+
+# Focus on:
+# - Failed APIs
+# - Slow transactions
+# - Errors (401, 500)
+# - Infra issues
+
+# Detected Issues:
+# {data.get("issues")}
+
+# Performance Data:
+# {data}
+
+# Find root cause and suggest fix.
+# """
+
+#         # Call Ollama API
+#         response = requests.post(
+#             f"{OLLAMA_URL}/api/generate",
+#             json={
+#                 "model": OLLAMA_MODEL,
+#                 "prompt": prompt,
+#                 "stream": False
+#             }
+#         )
+
+#         result = response.json()
+#         ai_result = result.get("response", "No response from Ollama")
+
+#         print("\nAI ANALYSIS RESULT\n")
+#         print(ai_result)
+
+#         return ai_result
+
+#     except Exception as e:
+#         print("AI Error:", str(e))
+#     return {"error": str(e)}
 # --------------------------------
 # MAIN AGENT
 # --------------------------------
 
-def run_agent(orch_markdown: str = ""):
+def mask_sensitive(data):
+
+    if isinstance(data, dict):
+        return {k: mask_sensitive(v) for k, v in data.items()}
+
+    elif isinstance(data, list):
+        return [mask_sensitive(i) for i in data]
+
+    elif isinstance(data, str):
+        for key in [
+            os.getenv("OPENAI_API_KEY"),
+            os.getenv("JIRA_API_TOKEN"),
+            os.getenv("GITHUB_TOKEN")
+        ]:
+            if key:
+                data = data.replace(key, "***")
+        return data
+
+    return data
+
+def run_agent():
 
     perf_data = run_tests()
     infra_data = run_rca()
@@ -472,7 +643,7 @@ def run_agent(orch_markdown: str = ""):
     cpu_check = detect_cpu_spike()
 
     thread_dump = get_thread_dump()
-    heap_dump = get_heap_snapshot() 
+    heap_dump = get_heap_snapshot()
 
     combined_data = {
         "performance": perf_data,
@@ -480,27 +651,64 @@ def run_agent(orch_markdown: str = ""):
         "issues": issues
     }
 
-    # AI
-    if ENABLE_AI == "true":
-        ai_result = ai_analysis(combined_data)
+    # ✅ ADD THIS
+    regression_detected = len(issues) > 0
+
+    # ✅ ONLY RUN IF REGRESSION
+    if regression_detected:
+
+        print("🚨 Regression detected — running RCA")
+
+        if ENABLE_AI == "true":
+            # ai_result = ai_analysis(combined_data)
+            safe_data = mask_sensitive(combined_data)
+            ai_result = ai_analysis(safe_data)
+        else:
+            ai_result = "AI disabled"
+
+        # ✅ RCA DATA
+        git_diff = infra_data.get("git_diff")
+        grafana = perf_data.get("grafana")
+        datadog = perf_data.get("datadog")
+
+        rca_report = f"""
+🚨 Regression Detected
+
+AI Analysis:
+{ai_result}
+
+Git Diff:
+{git_diff}
+
+Grafana:
+{grafana}
+
+Datadog:
+{datadog}
+"""
+
     else:
-        ai_result = "AI disabled by configuration"
+        print("✅ No regression — skipping AI & JIRA")
+        ai_result = "No regression detected"
+        rca_report = ai_result
 
     # JIRA
     try:
-        # Skip if JIRA is not configured
-        if JIRA_URL and JIRA_EMAIL and JIRA_API_TOKEN and JIRA_PROJECT_KEY \
-                and "xxxxx" not in JIRA_URL and "xxxxx" not in JIRA_API_TOKEN:
-            jira_ticket = create_jira_ticket(
-                "Performance Regression Detected",
-                str(ai_result)
-            )
+        # ✅ ONLY CREATE JIRA IF REGRESSION
+        if regression_detected:
+            try:
+                jira_ticket = create_jira_ticket(
+                    "Performance Regression Detected",
+                    rca_report
+                )
+            except Exception as e:
+                print("Jira failed:", e)
+                jira_ticket = {}
         else:
-            print("[jira] Skipped — JIRA credentials not configured")
-            jira_ticket = {"status": "skipped"}
+            jira_ticket = {}
     except Exception as e:
         print("Jira failed:", e)
-        jira_ticket = {"error": str(e)}
+        jira_ticket = {}
 
     # RESULT
     result = {
@@ -546,19 +754,13 @@ Slack + Email triggered successfully
 """
 
     # SEND
-    # Always write to reports/ folder first — works even without Slack/Email
-    try:
-        report_path = write_report(result, orch_markdown)
-        log.info(f"Report saved: {report_path}")
-    except Exception as e:
-        print("Report write failed:", e)
-
     try:
         send_slack(final_message)
     except Exception as e:
         print("Slack failed:", e)
 
     try:
+        connect()
         send_email(final_message)
     except Exception as e:
         print("Email failed:", e)
@@ -566,96 +768,95 @@ Slack + Email triggered successfully
     # PRINT
     print("\n================ FINAL REPORT (JSON) ================\n")
     print(json.dumps(result, indent=4))
+    print("Issues:", issues)
+    print("Regression:", regression_detected)
+    print("JIRA:", jira_ticket.get("key") if jira_ticket else "Not created")
     print("\n====================================================\n")
 
-    return result   # ✅ ONLY ONE return (inside function)
-
+    return result
 # --------------------------------
 # GITHUB WEBHOOK
 # --------------------------------
-
 @app.route("/github-webhook", methods=["POST"])
 def github_push():
 
     try:
+        print("\n🔔 Incoming webhook request...")
 
+        # --------------------------------
+        # 🔐 VERIFY SIGNATURE (SECURITY)
+        # --------------------------------
+        signature = request.headers.get("X-Hub-Signature-256")
+        payload_raw = request.data
+
+        if not signature:
+           print("⚠️ No signature (testing mode)")
+        else:   
+            if not verify_signature(payload_raw, signature):
+                print("❌ Invalid webhook signature")
+                return "Unauthorized", 401
+
+
+
+        print("✅ Webhook verified successfully")
+
+        # --------------------------------
+        # Parse payload
+        # --------------------------------
         payload = request.json
 
         print("\n=================================")
-        print("GitHub Event Received")
-        print("Payload:", payload)
+        print("📦 GitHub Event Received")
         print("=================================\n")
 
         # --------------------------------
         # Extract PR Number (if PR event)
         # --------------------------------
-
         pr_number = None
 
         if "pull_request" in payload:
             pr_number = payload["pull_request"]["number"]
+            print(f"🔢 PR Detected: {pr_number}")
 
         # --------------------------------
-        # Smart Webhook Filter
-        # Only run tests on main branch
+        # Branch Filter
         # --------------------------------
-
         branch = payload.get("ref")
 
         if branch and branch != "refs/heads/main":
-
-            print("Skipping non-main branch")
-
+            print("⏭ Skipping non-main branch")
             return jsonify({
                 "message": "Skipped non main branch"
             })
 
-        # ── Step 1: Code-change detection + script generation/patching ──────────
-        commit_sha = None
-        if "head_commit" in payload:
-            commit_sha = payload["head_commit"].get("id")
+        print("🚀 Running AI Agent...")
 
-        # Only run orchestration when we have real GitHub data to work with
-        orch_markdown = ""
-        if pr_number or commit_sha:
-            log.info(
-                f"[webhook] Queuing orchestration for "
-                f"{'PR #' + str(pr_number) if pr_number else 'commit ' + str(commit_sha)[:8]} "
-                f"— queue depth: {_webhook_queue.queue_depth}"
-            )
-            future = _webhook_queue.submit(
-                orchestrate,
-                pr_number=pr_number,
-                commit_sha=commit_sha,
-            )
-            orch_result = future.result(timeout=600)   # wait up to 10 min
-            orch_markdown = orch_result.to_markdown()
-            log.info(f"[webhook] Orchestration: {orch_result.summary}")
-        else:
-            log.info("[webhook] No PR number or commit SHA in payload — skipping orchestration")
+        # --------------------------------
+        # Run Agent
+        # --------------------------------
+        result = run_agent()
 
-        # ── Step 2: Run existing performance agent ────────────────────────────
-        result = run_agent(orch_markdown=orch_markdown)
+        # --------------------------------
+        # Post PR Comment (if PR)
+        # --------------------------------
+        if pr_number:
+            print("💬 Posting PR comment...")
+            comment_pr(pr_number, result["ai_analysis"])
 
-        # ── Step 3: Post PR comment (regression + script-change report) ───────
-        if pr_number and orch_markdown:
-            combined_comment = orch_markdown + "\n\n---\n\n" + str(result.get("ai_analysis", ""))
-            comment_pr(pr_number, combined_comment)
+        print("✅ Webhook execution completed")
 
         return jsonify({
             "message": "AI Agent Executed",
-            "orchestration": orch_markdown or "skipped (no PR/commit data)",
             "result": result
         }), 200
 
     except Exception as e:
 
-        print("Webhook Error:", str(e))
+        print("❌ Webhook Error:", str(e))
 
         return jsonify({
             "error": str(e)
         }), 500
-
 
 # --------------------------------
 # HEALTH CHECK
@@ -674,7 +875,7 @@ def trigger_slack():
 
     print("Triggered from Slack")
 
-    result = run_agent(orch_markdown="")
+    result = run_agent()
 
     return jsonify({
         "message": "Triggered via Slack",

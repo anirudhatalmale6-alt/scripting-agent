@@ -1,13 +1,16 @@
-import os
-import requests
+def get_tools():
 
-OPENSPEC_URL = os.getenv("OPENSPEC_URL")
-
-def get_spec():
-
-    try:
-        response = requests.get(OPENSPEC_URL)
-        return response.json()
-
-    except Exception as e:
-        return {"error": str(e)}
+    return [
+        {
+            "name": "speedcurve",
+            "description": "Get website performance metrics like load time, page speed, errors"
+        },
+        {
+            "name": "datadog_metrics",
+            "description": "Get infrastructure metrics like CPU, memory, server health"
+        },
+        {
+            "name": "github_commits",
+            "description": "Fetch latest commits and code changes from repository"
+        }
+    ]
