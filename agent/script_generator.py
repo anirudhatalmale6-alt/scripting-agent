@@ -748,15 +748,8 @@ Keep class structure. Return ONLY Java code, no fences.
 
 def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -> GeneratedScripts:
     """
-    Create or update all 3 script types for one feature.
-
-    Paths (all folders created automatically if missing):
-      scripts/<repo_slug>/<env>/k6/<slug>_perf_test.js
-      scripts/<repo_slug>/<env>/loadrunner/<slug>_lr_test.py
-      scripts/<repo_slug>/<env>/selenium/<slug>_selenium_test.py
-
-    - Script missing  → CREATE
-    - Script present  → UPDATE via GPT
+    Create or update k6 and Selenium scripts for one feature.
+    LoadRunner is handled as a single journey script in generate_all — not per endpoint.
     """
     root  = _script_root(repo, env)
     fslug = _slug(feature.path)
@@ -777,15 +770,8 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
     result.k6_validation_attempts = attempts
     result.k6_validation_error    = error
 
-    # LoadRunner (.c VuGen format)
-    lr_path = os.path.join(root, "loadrunner", f"{fslug}_lr_test.c")
-    result.loadrunner_path = lr_path
-    if os.path.exists(lr_path):
-        print(f"[script_generator] UPDATE loadrunner: {lr_path}")
-        _write(lr_path, _update_loadrunner(open(lr_path, encoding="utf-8").read(), feature))
-    else:
-        print(f"[script_generator] CREATE loadrunner: {lr_path}")
-        _write(lr_path, _generate_loadrunner(feature))
+    # LoadRunner — journey script only, generated once in generate_all
+    result.loadrunner_path = os.path.join(root, "loadrunner", "full_journey_lr_test.c")
 
     # Selenium (Java Maven project)
     sel_root = os.path.join(root, "selenium")
@@ -916,6 +902,40 @@ def _is_meaningful_path(path: str) -> bool:
     return len(slug) >= 3
 
 
+def _deduplicate_features(features: List[FeatureChange]) -> List[FeatureChange]:
+    """
+    Remove duplicate endpoints that test the same resource.
+
+    Rules:
+    - '/api/orders' and '/api/orders/{id}' → keep '/api/orders/{id}' (more specific)
+    - Same method + same resource → keep one
+    - Blank slug paths (GET /) → drop entirely
+    """
+    # Group by (method, resource) where resource = first non-param path segment
+    def resource_key(f: FeatureChange) -> str:
+        parts = [p for p in f.path.strip("/").split("/")
+                 if p and not p.startswith("{")]
+        return f.method.upper() + ":" + (parts[0] if parts else "")
+
+    seen_keys: dict = {}
+    for f in features:
+        key = resource_key(f)
+        if not key.endswith(":"):  # skip blank resource
+            existing = seen_keys.get(key)
+            if existing is None:
+                seen_keys[key] = f
+            else:
+                # Keep the more specific path (longer = more specific)
+                if len(f.path) > len(existing.path):
+                    seen_keys[key] = f
+
+    result = list(seen_keys.values())
+    dropped = len(features) - len(result)
+    if dropped:
+        print(f"[script_generator] Deduplicated {dropped} redundant endpoints")
+    return result
+
+
 def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = "") -> List[GeneratedScripts]:
     """
     Generate/update scripts for all features.
@@ -924,6 +944,7 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
     """
     results = []
     meaningful = [f for f in features if _is_meaningful_path(f.path)]
+    meaningful = _deduplicate_features(meaningful)
     skipped    = len(features) - len(meaningful)
     if skipped:
         print(f"[script_generator] Skipped {skipped} features with no meaningful path slug")

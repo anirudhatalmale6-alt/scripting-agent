@@ -278,6 +278,12 @@ if __name__ == "__main__":
             })
             return
 
+        # Deduplicate — same resource+method keeps most specific path only
+        from agent.script_generator import _is_meaningful_path, _deduplicate_features
+        all_features = [f for f in all_features if _is_meaningful_path(f.path)]
+        all_features = _deduplicate_features(all_features)
+        log.info(f"[startup] After dedup: {len(all_features)} unique endpoints to generate")
+
         # ── Step 2: check which scripts are missing on disk ───────────────────
         missing = []
         for feat in all_features:
