@@ -796,70 +796,69 @@ Keep class structure. Return ONLY Java code, no fences.
 
 def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -> GeneratedScripts:
     """
-    Create or update k6 and Selenium scripts for one feature.
-    Uses templates during initial generation — AI only on webhook-triggered updates.
-    LoadRunner is handled as a single journey script in generate_all.
+    Create or update scripts for one feature.
+    Respects ENABLE_K6, ENABLE_SELENIUM, ENABLE_LOADRUNNER flags.
+    Uses templates on CREATE (no AI), AI only on UPDATE (webhook-triggered).
     """
-    root  = _script_root(repo, env)
-    fslug = _slug(feature.path)
+    root   = _script_root(repo, env)
+    fslug  = _slug(feature.path)
     result = GeneratedScripts(feature=feature)
 
-    # k6 — use template for CREATE, AI only for UPDATE
-    k6_path = os.path.join(root, "k6", f"{fslug}_perf_test.js")
-    result.k6_path = k6_path
-    if os.path.exists(k6_path):
-        print(f"[script_generator] UPDATE k6: {k6_path}")
-        _write(k6_path, _update_k6(open(k6_path, encoding="utf-8").read(), feature, env))
-    else:
-        print(f"[script_generator] CREATE k6: {k6_path}")
-        _write(k6_path, _k6_template(feature, env))  # template, no AI, no validation
+    enable_k6  = os.getenv("ENABLE_K6",  "true").lower() == "true"
+    enable_sel = os.getenv("ENABLE_SELENIUM", "true").lower() == "true"
 
-    result.k6_validated           = True
-    result.k6_validation_attempts = 0
-    result.k6_validation_error    = ""
+    # ── k6 ────────────────────────────────────────────────────────────────────
+    if enable_k6:
+        k6_path = os.path.join(root, "k6", f"{fslug}_perf_test.js")
+        result.k6_path = k6_path
+        if os.path.exists(k6_path):
+            print(f"[script_generator] UPDATE k6: {k6_path}")
+            _write(k6_path, _update_k6(open(k6_path, encoding="utf-8").read(), feature, env))
+        else:
+            print(f"[script_generator] CREATE k6: {k6_path}")
+            _write(k6_path, _k6_template(feature, env))
+    result.k6_validated = True
 
-    # Selenium — use template for CREATE, AI only for UPDATE
-    sel_root = os.path.join(root, "selenium")
-    class_name = _java_class_name(feature.path)
-    test_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
-    page_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "pages")
-    res_dir    = os.path.join(sel_root, "src", "test", "resources")
-    for d in [test_dir, page_dir, res_dir, os.path.join(sel_root, "src", "main", "java")]:
-        os.makedirs(d, exist_ok=True)
+    # ── Selenium (Java Maven) ─────────────────────────────────────────────────
+    if enable_sel:
+        sel_root   = os.path.join(root, "selenium")
+        class_name = _java_class_name(feature.path)
+        test_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
+        page_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "pages")
+        res_dir    = os.path.join(sel_root, "src", "test", "resources")
+        for d in [test_dir, page_dir, res_dir,
+                  os.path.join(sel_root, "src", "main", "java")]:
+            os.makedirs(d, exist_ok=True)
 
-    pom_path = os.path.join(sel_root, "pom.xml")
-    if not os.path.exists(pom_path):
-        _write(pom_path, _selenium_pom())
+        if not os.path.exists(os.path.join(sel_root, "pom.xml")):
+            _write(os.path.join(sel_root, "pom.xml"), _selenium_pom())
+        if not os.path.exists(os.path.join(test_dir, "BaseTest.java")):
+            _write(os.path.join(test_dir, "BaseTest.java"),
+                   _selenium_base_test(os.getenv("SFCC_SITE_URL", BASE_URL)))
 
-    base_path = os.path.join(test_dir, "BaseTest.java")
-    if not os.path.exists(base_path):
-        _write(base_path, _selenium_base_test(os.getenv("SFCC_SITE_URL", BASE_URL)))
+        page_path = os.path.join(page_dir, f"{class_name}Page.java")
+        test_path = os.path.join(test_dir, f"{class_name}Test.java")
 
-    page_path = os.path.join(page_dir, f"{class_name}Page.java")
-    test_path = os.path.join(test_dir, f"{class_name}Test.java")
+        if os.path.exists(test_path) and _openai_available():
+            # UPDATE via AI — only on webhook-triggered change
+            _write(page_path, _update_selenium_java_ai(
+                open(page_path, encoding="utf-8").read() if os.path.exists(page_path) else "",
+                feature, "page", class_name))
+            _write(test_path, _update_selenium_java_ai(
+                open(test_path, encoding="utf-8").read(), feature, "test", class_name))
+        else:
+            # CREATE via template — zero AI calls
+            if not os.path.exists(page_path):
+                _write(page_path, _selenium_page_template(class_name, feature))
+            if not os.path.exists(test_path):
+                _write(test_path, _selenium_test_template(class_name, feature))
 
-    if os.path.exists(test_path) and _openai_available():
-        # UPDATE via AI only when file already exists (webhook-triggered change)
-        _write(page_path, _update_selenium_java_ai(
-            open(page_path, encoding="utf-8").read() if os.path.exists(page_path) else "",
-            feature, "page", class_name))
-        _write(test_path, _update_selenium_java_ai(
-            open(test_path, encoding="utf-8").read(), feature, "test", class_name))
-    else:
-        # CREATE via template — no AI call
-        if not os.path.exists(page_path):
-            _write(page_path, _selenium_page_template(class_name, feature))
-        if not os.path.exists(test_path):
-            _write(test_path, _selenium_test_template(class_name, feature))
+        existing_tests = [f.replace(".java", "") for f in os.listdir(test_dir)
+                          if f.endswith("Test.java") and f != "BaseTest.java"]
+        _write(os.path.join(res_dir, "testng.xml"), _selenium_testng_xml(existing_tests))
+        result.selenium_path = test_path
 
-    # Regenerate testng.xml to include all test classes
-    existing_tests = [f.replace(".java", "") for f in os.listdir(test_dir)
-                      if f.endswith("Test.java") and f != "BaseTest.java"]
-    _write(os.path.join(res_dir, "testng.xml"), _selenium_testng_xml(existing_tests))
-
-    result.selenium_path = test_path
-
-    # LoadRunner — journey script only, generated once in generate_all
+    # LoadRunner path set here — journey generated once in generate_all
     result.loadrunner_path = os.path.join(root, "loadrunner", "full_journey_lr_test.c")
 
     return result
@@ -978,24 +977,34 @@ def _is_meaningful_path(path: str) -> bool:
     return len(slug) >= 3
 
 
+def _normalize_path(path: str) -> str:
+    """Normalize path for dedup — strip /api/ prefix, trailing slash."""
+    p = path.strip("/")
+    if p.startswith("api/"):
+        p = p[4:]
+    return "/" + p.rstrip("/")
+
+
 def _deduplicate_features(features: List[FeatureChange]) -> List[FeatureChange]:
     """
-    Remove truly duplicate endpoints only.
-    Rule: same method + same path → keep one (exact duplicate).
-    Different methods on same path are kept (GET /users ≠ POST /users).
-    /api/users and /api/users/{id} are kept as separate scripts.
+    Remove exact duplicates and paths that differ only by /api/ prefix.
+    e.g. POST /api/users and POST /users/ → keep one (prefer the one with prefix).
     """
-    seen: set = set()
-    result = []
+    # Group by (method, normalized_path)
+    seen: dict = {}
     for f in features:
-        key = (f.method.upper(), f.path)
+        key = (f.method.upper(), _normalize_path(f.path))
         if key not in seen:
-            seen.add(key)
-            result.append(f)
+            seen[key] = f
+        else:
+            # Prefer the longer/more specific path
+            if len(f.path) > len(seen[key].path):
+                seen[key] = f
 
+    result = list(seen.values())
     dropped = len(features) - len(result)
     if dropped:
-        print(f"[script_generator] Deduplicated {dropped} exact duplicate endpoints")
+        print(f"[script_generator] Deduplicated {dropped} redundant endpoints")
     return result
 
 
@@ -1017,7 +1026,7 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
         results.append(generate_scripts(feature, env, repo))
 
     # Generate one combined LoadRunner journey script covering all endpoints
-    if meaningful:
+    if meaningful and os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true":
         _generate_lr_journey(meaningful, env, repo)
 
     return results

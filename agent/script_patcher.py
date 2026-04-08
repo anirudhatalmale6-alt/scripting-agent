@@ -162,51 +162,52 @@ Script:
 
 def patch_for_feature(feature: FeatureChange, repo: str = "") -> List[PatchResult]:
     """
-    Find scripts that test the same path and update them to match the new
-    method, path, or parameters.
+    Find scripts that test the same endpoint and update them.
+    Matches by resource name extracted from both the feature path and script filename.
+    e.g. routers/products.py changed → finds products_perf_test.js, ProductsTest.java etc.
     """
     results: List[PatchResult] = []
     scripts = _find_scripts(repo)
 
-    # Normalise path for matching (strip leading slash, replace params)
-    path_slug = re.sub(r'[^a-z0-9]', '', feature.path.lower())
+    # Extract resource name from feature path and source file
+    # /api/products/{id} → "products", routers/products.py → "products"
+    path_parts = [p for p in feature.path.strip("/").split("/")
+                  if p and not p.startswith("{") and p != "api"]
+    file_parts = os.path.basename(feature.file).replace(".py", "").replace(".js", "").replace(".ts", "")
 
-    # If path_slug is empty (e.g. path is just "/"), skip — too broad to match safely
-    if not path_slug:
+    # Build set of resource keywords to match against script filenames
+    keywords = set()
+    for p in path_parts:
+        keywords.add(p.lower())
+    keywords.add(file_parts.lower())
+    # Also add the router prefix if file is like "routers/products.py"
+    if "/" in feature.file:
+        keywords.add(os.path.basename(feature.file).split(".")[0].lower())
+
+    if not keywords or keywords == {""}:
         return results
 
     for script_path in scripts:
-        content = _read(script_path)
-
-        # Check if this script tests the same endpoint (loose match)
-        if path_slug not in re.sub(r'[^a-z0-9]', '', content.lower()):
+        script_name = os.path.basename(script_path).lower()
+        # Match if any keyword appears in the script filename
+        if not any(kw in script_name for kw in keywords if len(kw) > 2):
             continue
 
         print(f"[script_patcher] Patching {script_path} for changed feature {feature.path}")
 
         if not _openai_available():
-            results.append(PatchResult(
-                file=script_path,
-                patched=False,
-                reason=f"Skipped — OPENAI_API_KEY not configured (manual review needed for {feature.path})",
-            ))
+            results.append(PatchResult(file=script_path, patched=False,
+                reason=f"Skipped — no OpenAI key (manual review for {feature.path})"))
             continue
 
-        patched_content = _ai_patch_feature(script_path, content, feature)
-
-        if patched_content and patched_content != content:
+        patched_content = _ai_patch_feature(script_path, _read(script_path), feature)
+        if patched_content and patched_content != _read(script_path):
             _write(script_path, patched_content)
-            results.append(PatchResult(
-                file=script_path,
-                patched=True,
-                reason=f"Updated for {feature.method} {feature.path}: {feature.description}",
-            ))
+            results.append(PatchResult(file=script_path, patched=True,
+                reason=f"Updated for {feature.method} {feature.path}"))
         else:
-            results.append(PatchResult(
-                file=script_path,
-                patched=False,
-                reason="No changes needed",
-            ))
+            results.append(PatchResult(file=script_path, patched=False,
+                reason="No changes needed"))
 
     return results
 
