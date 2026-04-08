@@ -89,6 +89,20 @@ def github_webhook():
     md = result.to_markdown()
     log.info(f"[webhook] {result.summary}")
 
+    # Run sandbox tests if scripts were generated/updated
+    sandbox_summary = {}
+    if result.generated_scripts:
+        try:
+            from tools.test_runner import run_all_k6, run_all_selenium, summarise
+            env = os.getenv("ENV", "dev")
+            k6_results  = run_all_k6(GITHUB_REPO, env)
+            sel_results = run_all_selenium(GITHUB_REPO, env)
+            sandbox_summary = summarise(k6_results + sel_results)
+            log.info(f"[webhook] Sandbox: {sandbox_summary['passed']} passed, "
+                     f"{sandbox_summary['needs_manual']} need manual review")
+        except Exception as e:
+            log.warning(f"[webhook] Sandbox test failed: {e}")
+
     # Post PR comment
     if pr_number and md:
         try:
@@ -368,6 +382,21 @@ if __name__ == "__main__":
         })
         log.info(f"[startup] Done — {len(created)} generated, "
                  f"{len(all_existing)} total scripts registered")
+
+        # Auto-run sandbox tests after generation if any scripts were created
+        if created and os.getenv("AUTO_TEST_ON_STARTUP", "true").lower() == "true":
+            log.info("[startup] Running sandbox tests on generated scripts...")
+            try:
+                from tools.test_runner import run_all_k6, run_all_selenium, summarise
+                k6_results  = run_all_k6(GITHUB_REPO, env)
+                sel_results = run_all_selenium(GITHUB_REPO, env)
+                summary = summarise(k6_results + sel_results)
+                log.info(f"[startup] Sandbox test results: "
+                         f"{summary['passed']} passed, "
+                         f"{summary['needs_manual']} need manual review, "
+                         f"{summary['ai_fixes_used']} AI fixes used")
+            except Exception as e:
+                log.error(f"[startup] Sandbox test run failed: {e}")
 
     threading.Thread(target=_startup_generate, daemon=True).start()
 
