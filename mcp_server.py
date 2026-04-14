@@ -97,7 +97,7 @@ def _handle_k6(params: dict) -> dict:
 
 def _handle_run_tests(params: dict) -> dict:
     from tools.test_runner import run_all_k6, run_all_selenium, summarise
-    repo = params.get("repo", os.getenv("GITHUB_REPO", ""))
+    repo = params.get("repo", os.getenv("GITHUB_REPOS", "").split(",")[0].strip())
     env  = params.get("env", os.getenv("ENV", "dev"))
     k6_results  = run_all_k6(repo, env)
     sel_results = run_all_selenium(repo, env)

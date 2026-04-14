@@ -1,178 +1,119 @@
 """
 agent/commit_tracker.py
 ───────────────────────
-Persists a checkpoint of the last processed commit so the orchestrator
-processes ALL commits since the checkpoint — not just the latest one.
+One checkpoint file per repo:
+  .commit_checkpoint_owner__repo.json
 
-This handles the multi-developer scenario:
-  Dev A pushes commit abc123  → processed, checkpoint = abc123
-  Dev B pushes commit def456  → processed, checkpoint = def456
-  Dev C pushes commit ghi789  }
-  Dev D pushes commit jkl012  } both arrive before agent wakes up
-                               → agent fetches commits between def456..jkl012
-                               → processes ghi789 AND jkl012 in order
-                               → checkpoint = jkl012
-
-Checkpoint file: .commit_checkpoint.json
-  {
-    "last_processed_sha": "abc123...",
-    "last_processed_at":  "2026-04-02T10:00:00Z",
-    "repo":               "owner/repo",
-    "history": [
-      {
-        "sha":        "abc123...",
-        "processed_at": "2026-04-02T10:00:00Z",
-        "scripts_created": ["scripts/dev/api_orders_perf_test.js", ...],
-        "scripts_updated": ["scripts/dev/checkout_test.js"],
-        "dependency_changes": [{"package": "requests", "old": "2.28", "new": "2.31"}],
-        "feature_changes":    [{"method": "POST", "path": "/api/orders"}],
-        "summary": "Generated 3 scripts; patched 1."
-      }
-    ]
-  }
+This keeps repos fully isolated — no shared state, no conflicts
+when multiple repos are processed in parallel.
 
 Public API
 ──────────
-  get_checkpoint(repo: str) -> str | None
-  save_checkpoint(repo: str, sha: str, entry: dict)
-  get_unprocessed_commits(repo: str, current_sha: str, headers: dict) -> list[str]
+  get_checkpoint(repo)                          -> str | None
+  save_checkpoint(repo, sha, entry)
+  get_unprocessed_commits(repo, sha, headers)   -> list[str]
+  get_history(repo)                             -> list
+  get_full_report(repo)                         -> dict
 """
 
 import json
 import os
+import re
 import tempfile
 from datetime import datetime, timezone
 from typing import Optional
 
-_DEFAULT_CHECKPOINT = ".commit_checkpoint.json"
+
+def _repo_slug(repo: str) -> str:
+    """'owner/my-repo' → 'owner__my-repo'"""
+    return re.sub(r'[^a-z0-9_\-]+', '_', repo.lower()).replace('/', '__')
 
 
-def _get_checkpoint_file() -> str:
-    """Return a writable checkpoint file path, falling back to a temp file."""
-    path = os.environ.get("CHECKPOINT_FILE", _DEFAULT_CHECKPOINT)
-    fallback = os.path.join(tempfile.gettempdir(), "commit_checkpoint.json")
-    try:
-        if os.path.exists(path):
-            with open(path, "a", encoding="utf-8"):
-                pass
-        else:
-            dir_ = os.path.dirname(os.path.abspath(path)) or "."
-            probe = os.path.join(dir_, ".write_probe")
-            with open(probe, "w") as f:
-                f.write("")
-            os.remove(probe)
-        return path
-    except OSError:
-        print(f"[tracker] WARNING: {path} is not writable, using {fallback}")
-        return fallback
+def _checkpoint_file(repo: str) -> str:
+    """Return path to per-repo checkpoint file."""
+    slug = _repo_slug(repo)
+    filename = f".commit_checkpoint_{slug}.json"
+    # Support override via env (useful in tests)
+    base_dir = os.environ.get("CHECKPOINT_DIR", ".")
+    return os.path.join(base_dir, filename)
 
 
-def _load() -> dict:
-    cp = _get_checkpoint_file()
-    if os.path.exists(cp):
+def _load(repo: str) -> dict:
+    path = _checkpoint_file(repo)
+    if os.path.exists(path):
         try:
-            with open(cp, "r", encoding="utf-8") as f:
+            with open(path, "r", encoding="utf-8") as f:
                 return json.load(f)
         except Exception:
             pass
     return {}
 
 
-def _save(data: dict) -> None:
-    cp = _get_checkpoint_file()
-    if os.path.isdir(cp):
-        raise RuntimeError(
-            f"[tracker] FATAL: checkpoint path '{cp}' is a directory, not a file. "
-            "Remove the directory and let the agent create the file."
-        )
-    with open(cp, "w", encoding="utf-8") as f:
+def _save(repo: str, data: dict) -> None:
+    path = _checkpoint_file(repo)
+    with open(path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
 
 
+# ── Public API ────────────────────────────────────────────────────────────────
+
 def get_checkpoint(repo: str) -> Optional[str]:
     """Return the last processed commit SHA for this repo, or None."""
-    data = _load()
-    return data.get(repo, {}).get("last_processed_sha")
+    return _load(repo).get("last_processed_sha")
 
 
 def save_checkpoint(repo: str, sha: str, entry: dict) -> None:
-    """
-    Save a processed commit to the checkpoint file.
+    data = _load(repo)
+    if not data:
+        data = {"repo": repo, "last_processed_sha": None, "history": []}
 
-    entry should contain:
-      scripts_created, scripts_updated, dependency_changes,
-      feature_changes, summary
-    """
-    data = _load()
-    if repo not in data:
-        data[repo] = {"last_processed_sha": None, "history": []}
-
-    entry["sha"] = sha
+    entry["sha"]          = sha
     entry["processed_at"] = datetime.now(timezone.utc).isoformat()
 
-    data[repo]["last_processed_sha"] = sha
-    data[repo]["last_processed_at"] = entry["processed_at"]
-    data[repo]["repo"] = repo
+    data["last_processed_sha"] = sha
+    data["last_processed_at"]  = entry["processed_at"]
+    data["repo"]               = repo
 
-    # Keep last 100 entries
-    data[repo].setdefault("history", []).append(entry)
-    data[repo]["history"] = data[repo]["history"][-100:]
+    data.setdefault("history", []).append(entry)
+    data["history"] = data["history"][-100:]  # keep last 100
 
-    _save(data)
-    print(f"[tracker] Checkpoint saved: {repo} @ {sha[:8]}")
+    _save(repo, data)
+    print(f"[tracker] Checkpoint saved: {_checkpoint_file(repo)} @ {sha[:8]}")
 
 
-def get_unprocessed_commits(
-    repo: str,
-    current_sha: str,
-    headers: dict,
-) -> list:
-    """
-    Return ordered list of commit SHAs between last checkpoint and current_sha.
-    If no checkpoint exists, returns just [current_sha].
-    Oldest first so we process in chronological order.
-    """
-    import requests as _requests
+def get_unprocessed_commits(repo: str, current_sha: str, headers: dict) -> list:
+    import requests as _req
 
     last_sha = get_checkpoint(repo)
 
     if not last_sha:
-        print(f"[tracker] No checkpoint for {repo} — processing only current commit {current_sha[:8]}")
+        print(f"[tracker] No checkpoint for {repo} — processing {current_sha[:8]}")
         return [current_sha]
 
     if last_sha == current_sha:
-        print(f"[tracker] Commit {current_sha[:8]} already processed — skipping")
+        print(f"[tracker] {current_sha[:8]} already processed — skipping")
         return []
 
-    # Fetch commits between last_sha and current_sha
-    # GitHub compare API: GET /repos/{owner}/{repo}/compare/{base}...{head}
     url = f"https://api.github.com/repos/{repo}/compare/{last_sha}...{current_sha}"
     try:
-        resp = _requests.get(url, headers=headers, timeout=15)
+        resp = _req.get(url, headers=headers, timeout=15)
         if resp.status_code == 404:
-            # base commit no longer in history (force push / rebase) — reset
-            print(f"[tracker] Base commit {last_sha[:8]} not found — resetting checkpoint")
+            print(f"[tracker] Base {last_sha[:8]} not found — resetting")
             return [current_sha]
         resp.raise_for_status()
-        data = resp.json()
-        commits = data.get("commits", [])
-        shas = [c["sha"] for c in commits]
+        shas = [c["sha"] for c in resp.json().get("commits", [])]
         if not shas:
             shas = [current_sha]
-        print(f"[tracker] {len(shas)} unprocessed commit(s) since checkpoint {last_sha[:8]}")
-        return shas  # oldest first
+        print(f"[tracker] {len(shas)} unprocessed commit(s) since {last_sha[:8]}")
+        return shas
     except Exception as e:
-        print(f"[tracker] Compare failed: {e} — falling back to current commit only")
+        print(f"[tracker] Compare failed: {e} — using current commit only")
         return [current_sha]
 
 
 def get_history(repo: str) -> list:
-    """Return full processing history for a repo."""
-    data = _load()
-    return data.get(repo, {}).get("history", [])
+    return _load(repo).get("history", [])
 
 
 def get_full_report(repo: str) -> dict:
-    """Return the full checkpoint data for a repo."""
-    data = _load()
-    return data.get(repo, {})
+    return _load(repo)

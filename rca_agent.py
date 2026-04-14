@@ -68,7 +68,19 @@ GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 MCP_URL         = os.getenv("MCP_URL")
 TOKEN           = os.getenv("TOKEN")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = None
+
+def _get_openai_client():
+    global client
+    if client is not None:
+        return client
+    key = os.getenv("OPENAI_API_KEY", "")
+    if key and "xxxxxx" not in key and key.startswith("sk-"):
+        try:
+            client = OpenAI(api_key=key)
+        except Exception as e:
+            log.warning(f"[rca_agent] OpenAI init failed: {e}")
+    return client
 app    = Flask(__name__)
 
 
@@ -109,8 +121,13 @@ def detect_cpu_spike():
 
 # ── k6 ────────────────────────────────────────────────────────────────────────
 
-def run_k6():
-    return call_tool("k6")
+def _tool(name: str, params: dict = None) -> dict:
+    """Call MCP tool, return None if skipped/unavailable so callers can filter."""
+    result = call_tool(name, params or {})
+    if result.get("status") == "skipped" or "error" in result:
+        log.warning(f"[rca_agent] Tool '{name}' unavailable: {result}")
+        return {}
+    return result
 
 
 # ── Git diff ──────────────────────────────────────────────────────────────────
@@ -164,11 +181,14 @@ def extract_anomalies(perf):
 
 def ai_analysis(data):
     try:
+        c = _get_openai_client()
+        if not c:
+            return "AI unavailable — OPENAI_API_KEY not configured."
         prompt = f"""You are a performance engineer.
 Analyze system data. Focus on: Failed APIs, Slow transactions, Errors (401, 500), Infra issues.
 Detected Issues: {data['issues']}
 Performance Data: {data}"""
-        resp = client.chat.completions.create(
+        resp = c.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
                 {"role": "system", "content": "You are a performance engineering expert."},
@@ -184,25 +204,25 @@ Performance Data: {data}"""
 # ── Jira ──────────────────────────────────────────────────────────────────────
 
 def create_jira_ticket(summary, description):
-    return call_tool("jira", {"summary": summary, "description": description})
+    return _tool("jira", {"summary": summary, "description": description})
 
 
 # ── Main RCA pipeline ─────────────────────────────────────────────────────────
 
 def run_rca_pipeline(orch_markdown: str = "") -> dict:
     # Run all tests — AI self-heals failures, only sends summary to AI analysis
-    test_results = call_tool("run_tests", {
-        "repo": os.getenv("GITHUB_REPO", ""),
+    test_results = _tool("run_tests", {
+        "repo": os.getenv("GITHUB_REPOS", "").split(",")[0].strip(),
         "env":  os.getenv("ENV", "dev"),
     })
 
     perf_data = {
         "test_results": test_results,
-        "speedcurve":   call_tool("speedcurve"),
-        "datadog":      call_tool("datadog"),
+        "speedcurve":   _tool("speedcurve"),
+        "datadog":      _tool("datadog"),
     }
     infra_data = {
-        "commits":  call_tool("github_commits"),
+        "commits":  _tool("github_commits"),
         "git_diff": get_git_diff(),
     }
 

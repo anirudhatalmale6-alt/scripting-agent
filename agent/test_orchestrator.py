@@ -32,7 +32,7 @@ from agent.commit_tracker import get_checkpoint, save_checkpoint, get_unprocesse
 load_dotenv()
 
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO  = os.getenv("GITHUB_REPO")
+GITHUB_REPO  = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()  # primary repo fallback
 ENV          = os.getenv("ENV", "dev")
 
 HEADERS = {
@@ -158,14 +158,15 @@ def _get_pr_diff(pr_number: int) -> str:
         return ""
 
 
-def _get_commit_files(sha: str) -> list:
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/commits/{sha}"
+def _get_commit_files(sha: str, repo: str = None) -> list:
+    _repo = repo or GITHUB_REPO
+    url = f"https://api.github.com/repos/{_repo}/commits/{sha}"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         return resp.json().get("files", [])
     except Exception as e:
-        print(f"[orchestrator] Failed to fetch commit {sha[:8]}: {e}")
+        print(f"[orchestrator] Failed to fetch commit {sha[:8]} for {_repo}: {e}")
         return []
 
 
@@ -367,9 +368,11 @@ def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
 
 # ── Single-commit processing ──────────────────────────────────────────────────
 
-def _process_commit(sha: str, pre_health: HealthReport) -> dict:
-    print(f"[orchestrator] Processing commit {sha[:8]}")
-    changed_files = _get_commit_files(sha)
+def _process_commit(sha: str, pre_health: HealthReport, repo: str = None, env: str = None) -> dict:
+    _repo = repo or GITHUB_REPO
+    _env  = env  or ENV
+    print(f"[orchestrator] Processing commit {sha[:8]} for {_repo}")
+    changed_files = _get_commit_files(sha, _repo)
 
     if not changed_files:
         entry = {
@@ -377,15 +380,15 @@ def _process_commit(sha: str, pre_health: HealthReport) -> dict:
             "dependency_changes": [], "feature_changes": [],
             "summary": "No changed files.",
         }
-        save_checkpoint(GITHUB_REPO, sha, entry)
+        save_checkpoint(_repo, sha, entry)
         return entry
 
     change_report = detect_changes("", changed_files)
     scripts_created, scripts_updated, generated, patches = [], [], [], []
 
     if change_report.has_feature_changes:
-        print(f"[orchestrator] {len(change_report.feature_changes)} feature(s) detected")
-        generated = generate_all(change_report.feature_changes, env=ENV, repo=GITHUB_REPO)
+        print(f"[orchestrator] {len(change_report.feature_changes)} feature(s) detected in {_repo}")
+        generated = generate_all(change_report.feature_changes, env=_env, repo=_repo)
         for gs in generated:
             pre_paths = {r.path for r in pre_health.results}
             if gs.k6_path in pre_paths:
@@ -396,7 +399,7 @@ def _process_commit(sha: str, pre_health: HealthReport) -> dict:
         print(f"[orchestrator] {sha[:8]}: no Scenario A/B changes — checkpoint anchored, no scripts generated")
 
     if change_report.needs_action:
-        patches = patch_all(change_report, repo=GITHUB_REPO)
+        patches = patch_all(change_report, repo=_repo)
         scripts_updated += [r.file for r in patches if r.patched]
 
     summary = f"Created {len(scripts_created)} scripts; updated {len(scripts_updated)} scripts."
@@ -413,7 +416,7 @@ def _process_commit(sha: str, pre_health: HealthReport) -> dict:
                              for f in change_report.feature_changes],
         "summary": summary,
     }
-    save_checkpoint(GITHUB_REPO, sha, entry)
+    save_checkpoint(_repo, sha, entry)
     return {"change_report": change_report, "generated": generated,
             "patches": patches, "entry": entry}
 
@@ -423,20 +426,23 @@ def _process_commit(sha: str, pre_health: HealthReport) -> dict:
 def orchestrate(
     pr_number: Optional[int] = None,
     commit_sha: Optional[str] = None,
+    repo: Optional[str] = None,
 ) -> OrchestrationResult:
     """
     Full pipeline:
       PRE check → fix failures → detect → generate/patch → POST check → checkpoint
     """
     result = OrchestrationResult()
+    _repo = repo or GITHUB_REPO
+    _env  = ENV
 
-    if not GITHUB_REPO:
+    if not _repo:
         result.error = "GITHUB_REPO env var not set"
         return result
 
     # ── Step 1: PRE health check ──────────────────────────────────────────────
-    print("[orchestrator] Running PRE health check on existing scripts...")
-    pre_health = run_pre_check(GITHUB_REPO, ENV)
+    print(f"[orchestrator] Running PRE health check for {_repo}...")
+    pre_health = run_pre_check(_repo, _env)
     result.pre_health = pre_health
 
     # ── Step 2: Fix any pre-existing failures ─────────────────────────────────
@@ -445,7 +451,7 @@ def orchestrate(
 
     # ── PR event ──────────────────────────────────────────────────────────────
     if pr_number:
-        print(f"[orchestrator] Processing PR #{pr_number}")
+        print(f"[orchestrator] Processing PR #{pr_number} for {_repo}")
         changed_files = _get_pr_files(pr_number)
         diff_text     = _get_pr_diff(pr_number)
 
@@ -457,10 +463,10 @@ def orchestrate(
 
             if change_report.has_feature_changes:
                 result.generated_scripts = generate_all(
-                    change_report.feature_changes, env=ENV, repo=GITHUB_REPO
+                    change_report.feature_changes, env=_env, repo=_repo
                 )
             if change_report.needs_action:
-                result.patch_results = patch_all(change_report, repo=GITHUB_REPO)
+                result.patch_results = patch_all(change_report, repo=_repo)
 
             n_gen   = len(result.generated_scripts)
             n_patch = sum(1 for r in result.patch_results if r.patched)
@@ -468,8 +474,8 @@ def orchestrate(
             result.commits_processed = [f"PR#{pr_number}"]
 
         # POST check
-        print("[orchestrator] Running POST health check...")
-        result.post_health = run_post_check(GITHUB_REPO, ENV)
+        print(f"[orchestrator] Running POST health check for {_repo}...")
+        result.post_health = run_post_check(_repo, _env)
         return result
 
     # ── Push event ────────────────────────────────────────────────────────────
@@ -477,14 +483,14 @@ def orchestrate(
         result.error = "Must provide pr_number or commit_sha"
         return result
 
-    checkpoint = get_checkpoint(GITHUB_REPO)
-    print(f"[orchestrator] Push — current: {commit_sha[:8]}, "
+    checkpoint = get_checkpoint(_repo)
+    print(f"[orchestrator] Push on {_repo} — current: {commit_sha[:8]}, "
           f"checkpoint: {checkpoint[:8] if checkpoint else 'none'}")
 
-    shas = get_unprocessed_commits(GITHUB_REPO, commit_sha, HEADERS)
+    shas = get_unprocessed_commits(_repo, commit_sha, HEADERS)
     if not shas:
         result.summary = "All commits already processed."
-        result.post_health = run_post_check(GITHUB_REPO, ENV)
+        result.post_health = run_post_check(_repo, _env)
         return result
 
     all_generated: List[GeneratedScripts] = []
@@ -492,7 +498,7 @@ def orchestrate(
     last_report:   Optional[ChangeReport] = None
 
     for sha in shas:
-        out = _process_commit(sha, pre_health)
+        out = _process_commit(sha, pre_health, repo=_repo, env=_env)
         result.commits_processed.append(sha)
         if isinstance(out, dict) and "change_report" in out:
             last_report = out["change_report"]
@@ -504,15 +510,15 @@ def orchestrate(
     result.patch_results     = all_patches
 
     # ── Step 6: POST health check ─────────────────────────────────────────────
-    print("[orchestrator] Running POST health check...")
-    result.post_health = run_post_check(GITHUB_REPO, ENV)
+    print(f"[orchestrator] Running POST health check for {_repo}...")
+    result.post_health = run_post_check(_repo, _env)
 
     total_created = len([gs for gs in all_generated])
     total_patched = sum(1 for r in all_patches if r.patched)
     post_fail     = len(result.post_health.failing)
 
     result.summary = (
-        f"Processed {len(shas)} commit(s); "
+        f"Processed {len(shas)} commit(s) on {_repo}; "
         f"created/updated {total_created * 3} scripts; "
         f"patched {total_patched}; "
         f"post-check: {len(result.post_health.passing)} passing, {post_fail} failing."

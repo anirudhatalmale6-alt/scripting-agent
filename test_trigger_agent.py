@@ -53,7 +53,7 @@ log = logging.getLogger("test_trigger")
 app = Flask(__name__)
 _queue = WebhookQueue()
 
-GITHUB_REPO  = os.getenv("GITHUB_REPO", "")
+GITHUB_REPO  = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()  # primary repo for backward compat
 SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
 
 
@@ -87,7 +87,7 @@ def github_webhook():
     log.info(f"[webhook] Received from {event_repo} — PR: {pr_number}, "
              f"commit: {str(commit_sha)[:8] if commit_sha else None}")
 
-    future = _queue.submit(orchestrate, pr_number=pr_number, commit_sha=commit_sha)
+    future = _queue.submit(orchestrate, pr_number=pr_number, commit_sha=commit_sha, repo=event_repo)
 
     try:
         result = future.result(timeout=600)
@@ -104,8 +104,8 @@ def github_webhook():
         try:
             from tools.test_runner import run_all_k6, run_all_selenium, summarise
             env = os.getenv("ENV", "dev")
-            k6_results  = run_all_k6(GITHUB_REPO, env)
-            sel_results = run_all_selenium(GITHUB_REPO, env)
+            k6_results  = run_all_k6(event_repo, env)
+            sel_results = run_all_selenium(event_repo, env)
             sandbox_summary = summarise(k6_results + sel_results)
             log.info(f"[webhook] Sandbox: {sandbox_summary['passed']} passed, "
                      f"{sandbox_summary['needs_manual']} need manual review")
@@ -229,26 +229,38 @@ if __name__ == "__main__":
     # ── Startup: generate scripts if none exist AND no checkpoint for this repo ─
     def _startup_generate():
         import time
-        import requests
-        from agent.script_generator import repo_slug, generate_scripts, _slug
-        from agent.commit_tracker import get_checkpoint, save_checkpoint
-        from agent.code_change_detector import _parse_feature_diff, _ai_extract_features
         from agent.repo_config import get_repos
-        import glob
 
         repos = get_repos()
         if not repos:
-            log.warning("[startup] No repos configured — set GITHUB_REPOS or GITHUB_REPO in .env")
+            log.warning("[startup] No repos configured — set GITHUB_REPOS=owner/repo1,owner/repo2 in .env")
             return
 
         time.sleep(5)  # wait for network
 
-        for repo in repos:
-            log.info(f"[startup] Processing repo: {repo}")
-            _startup_scan_repo(repo)
+        if len(repos) == 1:
+            # Single repo — run directly
+            log.info(f"[startup] Processing repo: {repos[0]}")
+            _startup_scan_repo(repos[0])
+        else:
+            # Multiple repos — run in parallel threads
+            log.info(f"[startup] Processing {len(repos)} repos in parallel: {repos}")
+            threads = []
+            for repo in repos:
+                t = threading.Thread(
+                    target=_startup_scan_repo,
+                    args=(repo,),
+                    name=f"startup-{repo}",
+                    daemon=True,
+                )
+                threads.append(t)
+                t.start()
+            # Wait for all to complete
+            for t in threads:
+                t.join()
+            log.info(f"[startup] All {len(repos)} repos processed")
 
     def _startup_scan_repo(repo: str):
-        import time
         import requests
         from agent.script_generator import repo_slug, generate_scripts, _slug
         from agent.commit_tracker import get_checkpoint, save_checkpoint
@@ -342,8 +354,9 @@ if __name__ == "__main__":
             if not os.path.exists(k6_path) or not os.path.exists(sel_test):
                 missing.append(feat)
 
-        # Also check journey LR script
-        lr_missing = not os.path.exists(lr_journey)
+        # Also check journey LR script (only if LR enabled)
+        lr_missing = (os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true"
+                      and not os.path.exists(lr_journey))
 
         existing_count = len(all_features) - len(missing)
         log.info(f"[startup] {existing_count}/{len(all_features)} endpoint scripts exist, "
@@ -382,8 +395,8 @@ if __name__ == "__main__":
             except Exception as e:
                 log.error(f"[startup] Failed to generate {feat.path}: {e}")
 
-        # Generate LR journey if missing (covers all endpoints in one script)
-        if lr_missing and all_features:
+        # Generate LR journey if missing and flag enabled
+        if lr_missing and all_features and os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true":
             try:
                 from agent.script_generator import _generate_lr_journey
                 _generate_lr_journey(all_features, env=env, repo=repo)

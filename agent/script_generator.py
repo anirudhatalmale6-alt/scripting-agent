@@ -52,7 +52,9 @@ def _openai_available() -> bool:
 
 
 def _slug(text: str) -> str:
-    """'/api/orders/<id>' → 'api_orders_id'"""
+    """'/api/orders/<int:id>' → 'api_orders_id'"""
+    # Strip Flask typed params like <int:txn_id> → keep only the param name
+    text = re.sub(r'<\w+:(\w+)>', r'\1', text)
     return re.sub(r'[^a-z0-9]+', '_', text.lower()).strip('_')
 
 
@@ -336,17 +338,19 @@ Return ONLY JS, no fences.
 # ── LoadRunner (VuGen C format) ───────────────────────────────────────────────
 def _app_context(feature: "FeatureChange" = None) -> str:
     """Build prompt context from the actual repo and endpoint being tested."""
-    repo = os.getenv("GITHUB_REPO", "")
+    repo = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()
     base_url = os.getenv("SFCC_SITE_URL", "https://your-app.com")
     path = feature.path if feature else "/"
     method = feature.method if feature else "GET"
     desc = feature.description if feature else ""
+    stack = getattr(feature, "tech_stack", "") if feature else ""
+    stack_line = f"Server tech stack: {stack}\n" if stack else ""
     return f"""
 Target repo  : {repo}
 Base URL     : {base_url}
 Endpoint     : {method} {path}
 Description  : {desc}
-Write realistic transactions for this specific endpoint only.
+{stack_line}Write realistic transactions for this specific endpoint only.
 Use the base URL and path above — do not reference SauceDemo or WebTours.
 """
 
@@ -474,12 +478,13 @@ Keep vuser_init/Action/vuser_end structure. Return ONLY C code, no fences.
 # ─────────────────────────────────────────────────────────────────────────────
 
 def _java_class_name(path: str) -> str:
-    """'/orders/{order_id}' → 'Orders', '/users/' → 'Users'"""
-    parts = [p for p in path.strip("/").split("/")
-             if p and not p.startswith("{")]
+    """'/orders/{order_id}' → 'Orders', '/delete/<int:txn_id>' → 'Delete'"""
+    # Strip Flask typed params like <int:txn_id> and FastAPI params like {order_id}
+    clean = re.sub(r'<[^>]+>', '', path)
+    clean = re.sub(r'\{[^}]+\}', '', clean)
+    parts = [p for p in clean.strip("/").split("/") if p]
     if not parts:
         return "Home"
-    # Use last meaningful segment, capitalize
     return "".join(p.capitalize() for p in parts[-1].split("_"))
 
 
@@ -732,22 +737,27 @@ def _generate_selenium_java(feature: FeatureChange, sel_root: str,
 
 def _generate_selenium_java_ai(feature: FeatureChange, file_type: str,
                                 class_name: str) -> str:
-    """Generate Java Selenium Page Object or Test class via GPT."""
+    """Generate Java Selenium Page Object or Test class via GPT, stack-aware."""
+    stack = getattr(feature, "tech_stack", "") or "unknown"
     try:
         if file_type == "page":
             prompt = f"""Write a Java Selenium Page Object class for this endpoint.
 Endpoint: {feature.method} {feature.path} — {feature.description}
+Server tech stack: {stack}
 {_app_context(feature)}
 Requirements:
 - Package: com.ecommerce.pages
 - Class name: {class_name}Page
 - Use WebDriverWait (10s), By locators
 - Include isPageLoaded(), relevant element getters
+- If this is a REST/JSON API endpoint (not a browser page), add a note in a comment
+  and generate a minimal placeholder that just checks the URL is reachable
 - Return ONLY Java code, no markdown fences"""
         else:
-            path_safe = re.sub(r'\{{[^}}]+\}}', '1', feature.path)
+            path_safe = re.sub(r'<[^>]+>', '1', re.sub(r'\{[^}]+\}', '1', feature.path))
             prompt = f"""Write a Java TestNG Selenium test class for this endpoint.
 Endpoint: {feature.method} {feature.path} — {feature.description}
+Server tech stack: {stack}
 {_app_context(feature)}
 Requirements:
 - Package: com.ecommerce.tests
@@ -756,6 +766,7 @@ Requirements:
 - BASE_URL is inherited from BaseTest
 - Navigate to BASE_URL + "{path_safe}" in @BeforeMethod
 - Test page loads, URL correct, key elements visible
+- For POST/PUT/DELETE endpoints, test the HTTP response via RestAssured if appropriate
 - Return ONLY Java code, no markdown fences"""
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,

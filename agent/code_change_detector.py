@@ -62,7 +62,8 @@ DEPENDENCY_FILES = {
     "requirements.txt", "requirements-dev.txt", "requirements-test.txt",
     "package.json", "package-lock.json", "yarn.lock",
     "pyproject.toml", "setup.cfg", "setup.py", "Pipfile", "Pipfile.lock",
-    "Gemfile", "Gemfile.lock", "pom.xml", "build.gradle",
+    "Gemfile", "Gemfile.lock", "pom.xml", "build.gradle", "build.gradle.kts",
+    "Cargo.toml", "go.mod", "composer.json", "mix.exs", "pubspec.yaml",
 }
 
 # Regex patterns to detect new HTTP route definitions across frameworks
@@ -75,21 +76,65 @@ ROUTE_PATTERNS = [
     r'@\w+\.(get|post|put|patch|delete)\(["\']([^"\']+)["\']',
     # FastAPI api_route: @router.api_route('/path', methods=['GET'])
     r'@\w+\.api_route\(["\']([^"\']+)["\']',
-    # Express.js: router.get('/path', ...) / app.post('/path', ...)
-    r'(?:router|app)\.(get|post|put|patch|delete)\(["\']([^"\']+)["\']',
+    # Express.js / Fastify: router.get('/path') app.post('/path')
+    r'(?:router|app|fastify)\.(get|post|put|patch|delete)\(["\']([^"\']+)["\']',
+    # NestJS: @Get('/path') @Post('/path')
+    r'@(Get|Post|Put|Patch|Delete)\(["\']([^"\']+)["\']',
     # Django path/re_path: path('api/orders/', view)
     r'(?:path|re_path)\(["\']([^"\']+)["\']',
     # Spring / JAX-RS: @GetMapping("/path") @PostMapping("/path")
     r'@(Get|Post|Put|Patch|Delete)Mapping\(["\']([^"\']+)["\']',
+    # JAX-RS: @Path("/resource") + @GET/@POST
+    r'@(GET|POST|PUT|PATCH|DELETE)\b',
     # Generic @route decorator with method
     r'@route\(["\']([^"\']+)["\'].*?method=["\'](\w+)["\']',
-    # nopCommerce / ASP.NET MVC: [HttpGet("path")] [HttpPost("path")]
+    # ASP.NET MVC / nopCommerce: [HttpGet("path")] [HttpPost("path")]
     r'\[Http(Get|Post|Put|Patch|Delete)\(["\']([^"\']+)["\']',
-    # nopCommerce Route attribute: [Route("api/product/{id}")]
+    # ASP.NET Route attribute: [Route("api/product/{id}")]
     r'\[Route\(["\']([^"\']+)["\']',
     # ASP.NET minimal API: app.MapGet("/path") app.MapPost("/path")
     r'app\.Map(Get|Post|Put|Patch|Delete)\(["\']([^"\']+)["\']',
+    # Rails: get '/path', to: 'controller#action'  /  resources :orders
+    r'(?:get|post|put|patch|delete)\s+["\']([^"\']+)["\']',
+    r'resources?\s+:(\w+)',
+    # Laravel / Lumen: Route::get('/path', ...) Route::post('/path', ...)
+    r'Route::(get|post|put|patch|delete)\(["\']([^"\']+)["\']',
+    # Gin (Go): r.GET("/path") r.POST("/path")
+    r'(?:r|router|v\d+|api)\.(GET|POST|PUT|PATCH|DELETE)\(["\']([^"\']+)["\']',
+    # Echo (Go): e.GET("/path") group.POST("/path")
+    r'(?:e|g|api)\.(GET|POST|PUT|PATCH|DELETE)\(["\']([^"\']+)["\']',
+    # Actix-web (Rust): .route("/path", web::get()) / #[get("/path")]
+    r'#\[(get|post|put|patch|delete)\(["\']([^"\']+)["\']',
+    r'\.route\(["\']([^"\']+)["\'].*?web::(get|post|put|patch|delete)',
+    # Phoenix (Elixir): get "/path", Controller, :action
+    r'(?:get|post|put|patch|delete)\s+"([^"]+)"',
+    # Hapi.js: method: 'GET', path: '/path'
+    r'method:\s*["\'](\w+)["\'].*?path:\s*["\']([^"\']+)["\']',
+    # Koa / koa-router: router.get('/path', ...)
+    r'router\.(get|post|put|patch|delete)\(["\']([^"\']+)["\']',
+    # Fiber (Go): app.Get("/path") app.Post("/path")
+    r'app\.(Get|Post|Put|Patch|Delete)\(["\']([^"\']+)["\']',
 ]
+
+# Source file extensions across all major tech stacks
+SOURCE_EXTENSIONS = {
+    ".py", ".js", ".ts", ".jsx", ".tsx",   # Python, JS/TS
+    ".go",                                   # Go
+    ".java", ".kt", ".kts",                  # JVM
+    ".rb",                                   # Ruby
+    ".php",                                  # PHP
+    ".cs", ".cshtml", ".razor",              # .NET / C#
+    ".rs",                                   # Rust
+    ".ex", ".exs",                           # Elixir/Phoenix
+    ".swift",                                # Swift/Vapor
+    ".scala",                                # Scala/Play
+    ".clj", ".cljs",                         # Clojure
+    ".hs",                                   # Haskell/Servant
+    ".lua",                                  # Lua/OpenResty
+    ".cr",                                   # Crystal/Kemal
+    ".nim",                                  # Nim
+    ".dart",                                 # Dart/Shelf
+}
 
 
 @dataclass
@@ -108,6 +153,7 @@ class FeatureChange:
     method: str          # GET / POST / etc.
     path: str            # /api/checkout
     description: str     # AI-generated one-liner
+    tech_stack: str = "" # detected tech stack e.g. "Python/Flask"
 
 
 @dataclass
@@ -189,7 +235,7 @@ def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
     """
     Scan added lines (+) in a diff for new route decorators.
     Handles FastAPI APIRouter prefix so POST "/" in users.py → POST /users/
-    Falls back to GPT when patterns find nothing.
+    Falls back to GPT when patterns find nothing, or always for unknown stacks.
     """
     changes: List[FeatureChange] = []
     seen: set = set()
@@ -204,6 +250,9 @@ def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
     # Extract router prefix (FastAPI/Flask blueprint prefix)
     prefix = _extract_router_prefix(diff_text) or _extract_router_prefix(added_lines)
 
+    # Detect tech stack for smarter AI fallback
+    tech_stack = detect_tech_stack(filename, added_lines)
+
     for pattern in ROUTE_PATTERNS:
         for m in re.finditer(pattern, added_lines, re.MULTILINE | re.IGNORECASE):
             groups = m.groups()
@@ -213,6 +262,10 @@ def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
                 method, path = "GET", groups[0]
 
             method = method.upper()
+
+            # Validate — method must be a real HTTP verb
+            if method not in ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"):
+                continue
 
             # Prepend router prefix if path is relative (e.g. "/" → "/users/")
             if prefix and not path.startswith(prefix):
@@ -231,31 +284,44 @@ def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
                 method=method,
                 path=path,
                 description=f"New {method} endpoint at {path}",
+                tech_stack=tech_stack,
             ))
 
-    # GPT fallback — only when regex found nothing AND OpenAI key looks real
-    api_key = os.getenv("OPENAI_API_KEY", "")
-    openai_available = api_key and "xxxxxx" not in api_key and api_key.startswith("sk-")
+    # AI fallback:
+    #   - Always run when regex found nothing and file has enough content
+    #   - Also run for unknown/exotic stacks even if regex found something
+    #     (regex may have produced false positives or missed endpoints)
+    openai_available = _openai_available()
+    is_unknown_stack = tech_stack == "unknown" or not any(
+        ext in filename for ext in (".py", ".js", ".ts", ".java", ".cs", ".rb", ".go")
+    )
 
-    if not changes and _is_source_file(filename) and len(added_lines) > 50 and openai_available:
-        changes.extend(_ai_extract_features(filename, added_lines))
+    if openai_available and len(added_lines) > 50:
+        if not changes or is_unknown_stack:
+            ai_changes = _ai_extract_features(filename, added_lines, tech_stack)
+            # Merge — avoid duplicates
+            existing_keys = {(c.method, c.path) for c in changes}
+            for fc in ai_changes:
+                if (fc.method, fc.path) not in existing_keys:
+                    changes.append(fc)
+                    existing_keys.add((fc.method, fc.path))
 
     return changes
 
 
-def _ai_extract_features(filename: str, added_code: str) -> List[FeatureChange]:
+def _ai_extract_features(filename: str, added_code: str, tech_stack: str = "") -> List[FeatureChange]:
     """
-    Use GPT-4o-mini to extract new endpoints/features from added code when
-    regex patterns don't match (e.g. custom frameworks, decorators, etc.).
+    Use GPT to extract new endpoints/features from added code.
+    Used as primary detector for unknown stacks and fallback for known ones.
     """
     try:
-        prompt = f"""
-You are a code analysis assistant.
+        stack_hint = f"Tech stack: {tech_stack}\n" if tech_stack else ""
+        prompt = f"""You are a code analysis assistant.
 
 Analyse the following newly added code from file '{filename}' and extract
 any new HTTP endpoints, API routes, or significant new features.
 
-Return ONLY a JSON array (no markdown) like:
+{stack_hint}Return ONLY a JSON array (no markdown) like:
 [
   {{"method": "POST", "path": "/api/orders", "description": "Creates a new order"}}
 ]
@@ -263,7 +329,7 @@ Return ONLY a JSON array (no markdown) like:
 If there are no new endpoints or features, return an empty array: []
 
 Code:
-{added_code[:3000]}
+{added_code[:4000]}
 """
         openai_client = _get_openai_client()
         if not openai_client:
@@ -274,15 +340,21 @@ Code:
             temperature=0,
         )
         raw = response.choices[0].message.content.strip()
-        items = json.loads(raw)
+        # Strip markdown fences if present
+        raw = re.sub(r'^```[a-z]*\n?', '', raw, flags=re.MULTILINE)
+        raw = re.sub(r'\n?```$', '', raw, flags=re.MULTILINE)
+        items = json.loads(raw.strip())
         return [
             FeatureChange(
                 file=filename,
                 method=item.get("method", "GET").upper(),
                 path=item.get("path", "/"),
                 description=item.get("description", ""),
+                tech_stack=tech_stack,
             )
             for item in items
+            if item.get("method", "").upper() in
+               ("GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS")
         ]
     except Exception as e:
         print(f"[code_change_detector] AI feature extraction failed: {e}")
@@ -290,8 +362,101 @@ Code:
 
 
 def _is_source_file(filename: str) -> bool:
-    """Returns True for Python, JS, TS, Go, Java, C# source files."""
-    return filename.endswith((".py", ".js", ".ts", ".go", ".java", ".rb", ".cs", ".cshtml"))
+    """Returns True for any known backend/API source file extension."""
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in SOURCE_EXTENSIONS
+
+
+def detect_tech_stack(filename: str, diff_text: str = "") -> str:
+    """
+    Infer the tech stack from filename extension and content hints.
+    Returns a human-readable stack name used in AI prompts.
+    """
+    ext = os.path.splitext(filename)[1].lower()
+    content = diff_text.lower()
+
+    stack_map = {
+        ".py": "Python",
+        ".js": "JavaScript/Node.js",
+        ".ts": "TypeScript/Node.js",
+        ".jsx": "JavaScript/React",
+        ".tsx": "TypeScript/React",
+        ".go": "Go",
+        ".java": "Java",
+        ".kt": "Kotlin",
+        ".kts": "Kotlin",
+        ".rb": "Ruby",
+        ".php": "PHP",
+        ".cs": "C#/.NET",
+        ".cshtml": "C#/ASP.NET MVC",
+        ".razor": "C#/Blazor",
+        ".rs": "Rust",
+        ".ex": "Elixir",
+        ".exs": "Elixir",
+        ".swift": "Swift",
+        ".scala": "Scala",
+        ".clj": "Clojure",
+        ".cljs": "ClojureScript",
+        ".hs": "Haskell",
+        ".lua": "Lua",
+        ".cr": "Crystal",
+        ".dart": "Dart",
+    }
+    stack = stack_map.get(ext, "unknown")
+
+    # Refine with framework hints from content
+    if stack == "Python":
+        if "fastapi" in content or "from fastapi" in content:
+            stack = "Python/FastAPI"
+        elif "flask" in content or "from flask" in content:
+            stack = "Python/Flask"
+        elif "django" in content or "from django" in content:
+            stack = "Python/Django"
+    elif stack in ("JavaScript/Node.js", "TypeScript/Node.js"):
+        if "nestjs" in content or "@nestjs" in content or "from '@nestjs" in content:
+            stack = f"{stack.split('/')[0]}/NestJS"
+        elif "express" in content:
+            stack = f"{stack.split('/')[0]}/Express"
+        elif "fastify" in content:
+            stack = f"{stack.split('/')[0]}/Fastify"
+        elif "koa" in content:
+            stack = f"{stack.split('/')[0]}/Koa"
+    elif stack == "Go":
+        if "gin-gonic" in content or '"github.com/gin-gonic' in content:
+            stack = "Go/Gin"
+        elif "echo" in content or '"github.com/labstack' in content:
+            stack = "Go/Echo"
+        elif "fiber" in content or '"github.com/gofiber' in content:
+            stack = "Go/Fiber"
+    elif stack == "Ruby":
+        if "rails" in content or "actioncontroller" in content:
+            stack = "Ruby/Rails"
+        elif "sinatra" in content:
+            stack = "Ruby/Sinatra"
+    elif stack == "PHP":
+        if "laravel" in content or "illuminate" in content:
+            stack = "PHP/Laravel"
+        elif "symfony" in content:
+            stack = "PHP/Symfony"
+    elif stack == "Rust":
+        if "actix" in content:
+            stack = "Rust/Actix-web"
+        elif "axum" in content:
+            stack = "Rust/Axum"
+        elif "rocket" in content:
+            stack = "Rust/Rocket"
+    elif stack == "Elixir":
+        if "phoenix" in content:
+            stack = "Elixir/Phoenix"
+    elif stack in ("Java", "Kotlin"):
+        if "springframework" in content or "@springbootapplication" in content:
+            stack = f"{stack}/Spring Boot"
+        elif "quarkus" in content:
+            stack = f"{stack}/Quarkus"
+        elif "micronaut" in content:
+            stack = f"{stack}/Micronaut"
+
+    return stack
 
 
 def _is_dependency_file(filename: str) -> bool:
@@ -329,9 +494,10 @@ def detect_changes(diff_text: str, changed_files: list) -> ChangeReport:
 
         # ── Scenario B: new feature / endpoint ───────────────────────────────
         elif _is_source_file(filename) and status in ("added", "modified"):
+            stack = detect_tech_stack(filename, patch)
             features = _parse_feature_diff(filename, patch)
             report.feature_changes.extend(features)
-            print(f"[detector] Feature changes in {filename}: {len(features)} endpoints")
+            print(f"[detector] Feature changes in {filename} ({stack}): {len(features)} endpoints")
 
     # Generate a human-readable diff summary via GPT for the final report
     if diff_text:

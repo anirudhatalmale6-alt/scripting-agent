@@ -31,14 +31,17 @@ services:
       - ./logs:/app/logs
       - ./scripts:/app/scripts
       - ./reports:/app/reports
+      - ./checkpoints:/app/checkpoints
     depends_on:
-      - prometheus
+      prometheus:
+        condition: service_started
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5002/"]
-      interval: 60s
+      interval: 15s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 10s
 
   # ── Test Trigger Agent ────────────────────────────────────────────────────
   test-trigger-agent:
@@ -56,20 +59,24 @@ services:
       GRAFANA_USERNAME: ""
       GRAFANA_API_KEY: ""
       MCP_URL: http://mcp-server:5002
+      CHECKPOINT_DIR: /app/checkpoints
     volumes:
       - ./logs:/app/logs
       - ./scripts:/app/scripts
       - ./reports:/app/reports
-      - ./.commit_checkpoint.json:/app/.commit_checkpoint.json
+      - ./checkpoints:/app/checkpoints
     depends_on:
-      - prometheus
-      - mcp-server
+      prometheus:
+        condition: service_started
+      mcp-server:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5001/"]
-      interval: 60s
+      interval: 15s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 10s
 
   # ── RCA Agent ─────────────────────────────────────────────────────────────
   rca-agent:
@@ -77,7 +84,7 @@ services:
     container_name: rca-agent
     command: python rca_agent.py
     ports:
-      - "5000:5000"
+      - "5010:5000"
     env_file: .env
     environment:
       K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
@@ -87,19 +94,24 @@ services:
       GRAFANA_USERNAME: ""
       GRAFANA_API_KEY: ""
       MCP_URL: http://mcp-server:5002
+      CHECKPOINT_DIR: /app/checkpoints
     volumes:
       - ./logs:/app/logs
       - ./scripts:/app/scripts
       - ./reports:/app/reports
+      - ./checkpoints:/app/checkpoints
     depends_on:
-      - prometheus
-      - mcp-server
+      prometheus:
+        condition: service_started
+      mcp-server:
+        condition: service_healthy
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5000/"]
-      interval: 60s
+      interval: 15s
       timeout: 5s
-      retries: 3
+      retries: 5
+      start_period: 10s
 
   # ── Prometheus ────────────────────────────────────────────────────────────
   prometheus:
