@@ -1,26 +1,29 @@
 """
 agent/test_orchestrator.py
 ──────────────────────────
-Test Trigger Agent pipeline per commit:
+Test Trigger Agent pipeline per commit.
 
-  1. PRE health check  — run all existing scripts, record baseline
-  2. Fix pre-failing   — auto-fix any scripts already broken before this commit
-  3. Detect changes    — Scenario A (dep upgrade) / Scenario B (new feature)
-  4. Generate/update   — create new scripts or update existing ones
-  5. Patch             — update scripts for dep changes
-  6. POST health check — re-run all scripts, confirm everything passes
-  7. Save checkpoint   — record what was created/updated/fixed
+Pipeline:
+  1. PRE health check  — run existing scripts, record baseline
+  2. Fix pre-failing   — auto-fix scripts broken before this commit
+  3. Route             — use .perf/mappings.yaml to decide what to skip/run
+  4. Detect changes    — Scenario A (dep upgrade) / Scenario B (new feature)
+  5. Generate/update   — only scripts for affected domains
+  6. Patch             — update scripts for dep changes
+  7. POST health check — re-run all scripts, confirm everything passes
+  8. Merge gate        — apply pass/warn/fail from .perf/profiles/
+  9. Save checkpoint   — record what was created/updated/fixed
 
 Public API
 ──────────
-  orchestrate(pr_number, commit_sha) -> OrchestrationResult
+  orchestrate(pr_number, commit_sha, repo, impact_map) -> OrchestrationResult
 """
 
+import logging
 import os
-import re
 import requests
 from dataclasses import dataclass, field
-from typing import List, Optional
+from typing import Dict, List, Optional
 from dotenv import load_dotenv
 
 from agent.code_change_detector import detect_changes, ChangeReport
@@ -28,11 +31,18 @@ from agent.script_generator import generate_all, GeneratedScripts
 from agent.script_patcher import patch_all, PatchResult
 from agent.script_health_checker import run_pre_check, run_post_check, HealthReport
 from agent.commit_tracker import get_checkpoint, save_checkpoint, get_unprocessed_commits
+from agent.perf_policy import (
+    PerfPolicy, ProfileConfig,
+    load_policy, build_impact_map, should_skip_file,
+    get_profile, load_agent_skill,
+)
 
 load_dotenv()
 
+log = logging.getLogger(__name__)
+
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")
-GITHUB_REPO  = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()  # primary repo fallback
+GITHUB_REPO  = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()
 ENV          = os.getenv("ENV", "dev")
 
 HEADERS = {
@@ -40,8 +50,34 @@ HEADERS = {
     "Accept": "application/vnd.github+json",
 }
 
+# ── Cached module-level resources ─────────────────────────────────────────────
+_policy: Optional[PerfPolicy] = None
+_scripting_skill: str = ""
+
+
+def _get_policy() -> PerfPolicy:
+    global _policy
+    if _policy is None:
+        _policy = load_policy()
+    return _policy
+
+
+def _get_scripting_skill() -> str:
+    global _scripting_skill
+    if not _scripting_skill:
+        _scripting_skill = load_agent_skill("SCRIPTING_AGENT.md")
+    return _scripting_skill
+
 
 # ── Result dataclass ──────────────────────────────────────────────────────────
+
+@dataclass
+class MergeGateResult:
+    status: str = "pass"          # pass | warn | fail
+    reason: str = ""
+    risk_level: str = "low"
+    block_merge: bool = False
+
 
 @dataclass
 class OrchestrationResult:
@@ -51,7 +87,9 @@ class OrchestrationResult:
     commits_processed: List[str] = field(default_factory=list)
     pre_health: Optional[HealthReport] = None
     post_health: Optional[HealthReport] = None
-    scripts_fixed: List[str] = field(default_factory=list)   # pre-existing failures fixed
+    scripts_fixed: List[str] = field(default_factory=list)
+    impact_map: Dict = field(default_factory=dict)
+    merge_gate: MergeGateResult = field(default_factory=MergeGateResult)
     summary: str = ""
     error: Optional[str] = None
 
@@ -68,22 +106,30 @@ class OrchestrationResult:
                 f"({', '.join(s[:8] for s in self.commits_processed)})\n"
             )
 
-        # Health check delta
+        # Impact map
+        if self.impact_map.get("changed_domains"):
+            lines.append(f"**Affected domains:** {', '.join(self.impact_map['changed_domains'])}")
+            lines.append(f"**Risk level:** {self.impact_map.get('risk_level', 'low')}\n")
+
+        # Merge gate
+        gate = self.merge_gate
+        icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(gate.status, "ℹ️")
+        lines.append(f"**Merge gate:** {icon} {gate.status.upper()} — {gate.reason}\n")
+
         if self.pre_health:
             lines.append("### Script Health Check")
             lines.append(self.pre_health.to_markdown())
             lines.append("")
 
         if self.scripts_fixed:
-            lines.append("### Pre-existing Failures Fixed by Agent")
+            lines.append("### Pre-existing Failures Fixed")
             for s in self.scripts_fixed:
-                lines.append(f"- ✅ `{s}` (was failing before this commit)")
+                lines.append(f"- ✅ `{s}`")
             lines.append("")
 
         if self.post_health:
             lines.append(self.post_health.to_markdown())
             lines.append("")
-            # Delta summary
             if self.pre_health:
                 pre_fail  = len(self.pre_health.failing)
                 post_fail = len(self.post_health.failing)
@@ -92,7 +138,7 @@ class OrchestrationResult:
                 elif post_fail < pre_fail:
                     lines.append(f"⚠️ {post_fail} script(s) still failing (improved from {pre_fail}).")
                 else:
-                    lines.append(f"❌ {post_fail} script(s) failing after changes — manual review needed.")
+                    lines.append(f"❌ {post_fail} script(s) failing — manual review needed.")
             lines.append("")
 
         cr = self.change_report
@@ -132,21 +178,84 @@ class OrchestrationResult:
         return "\n".join(lines)
 
 
+# ── Merge gate ────────────────────────────────────────────────────────────────
+
+def _evaluate_merge_gate(
+    post_health: HealthReport,
+    impact_map: dict,
+    profile: Optional[ProfileConfig],
+) -> MergeGateResult:
+    """
+    Apply merge gate rules from the execution profile.
+    Returns MergeGateResult with status: pass | warn | fail.
+    """
+    risk = impact_map.get("risk_level", "low")
+    post_fail = len(post_health.failing) if post_health else 0
+
+    # No profile — default permissive gate
+    if not profile:
+        if post_fail == 0:
+            return MergeGateResult(status="pass", reason="All scripts passing", risk_level=risk)
+        return MergeGateResult(
+            status="warn", reason=f"{post_fail} script(s) failing", risk_level=risk
+        )
+
+    block_on_critical = getattr(profile, "block_on_critical_flow_failure", True)
+    warn_pct  = getattr(profile, "warn_on_regression_pct",  20)
+    block_pct = getattr(profile, "block_on_regression_pct", 50)
+
+    # Critical flow failure on high-risk domain
+    if post_fail > 0 and risk == "high" and block_on_critical:
+        return MergeGateResult(
+            status="fail",
+            reason=f"{post_fail} script(s) failing on high-risk domain — merge blocked",
+            risk_level=risk,
+            block_merge=True,
+        )
+
+    # Percentage-based gate (when we have pre+post counts)
+    if post_health and post_fail > 0:
+        total = len(post_health.passing) + post_fail
+        fail_pct = (post_fail / total * 100) if total > 0 else 0
+        if fail_pct >= block_pct:
+            return MergeGateResult(
+                status="fail",
+                reason=f"{fail_pct:.0f}% scripts failing (threshold: {block_pct}%) — merge blocked",
+                risk_level=risk,
+                block_merge=True,
+            )
+        if fail_pct >= warn_pct:
+            return MergeGateResult(
+                status="warn",
+                reason=f"{fail_pct:.0f}% scripts failing (warn threshold: {warn_pct}%)",
+                risk_level=risk,
+            )
+
+    if post_fail == 0:
+        return MergeGateResult(status="pass", reason="All scripts passing", risk_level=risk)
+
+    return MergeGateResult(
+        status="warn", reason=f"{post_fail} script(s) failing", risk_level=risk
+    )
+
+
 # ── GitHub API helpers ────────────────────────────────────────────────────────
 
-def _get_pr_files(pr_number: int) -> list:
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}/files"
+def _get_pr_files(pr_number: int, repo: str = None) -> list:
+    _repo = repo or GITHUB_REPO
+    url = f"https://api.github.com/repos/{_repo}/pulls/{pr_number}/files"
     try:
         resp = requests.get(url, headers=HEADERS, timeout=15)
         resp.raise_for_status()
         return resp.json()
     except Exception as e:
-        print(f"[orchestrator] Failed to fetch PR files: {e}")
+        log.warning(f"[orchestrator] Failed to fetch PR files: {e}")
         return []
 
 
-def _get_pr_diff(pr_number: int) -> str:
-    url = f"https://api.github.com/repos/{GITHUB_REPO}/pulls/{pr_number}"
+def _get_pr_diff(pr_number: int, repo: str = None) -> str:
+    _repo = repo or GITHUB_REPO
+    url = f"https://api.github.com/repos/{_repo}/pulls/{pr_number}"
     try:
         resp = requests.get(
             url, headers={**HEADERS, "Accept": "application/vnd.github.diff"}, timeout=15,
@@ -154,7 +263,7 @@ def _get_pr_diff(pr_number: int) -> str:
         resp.raise_for_status()
         return resp.text
     except Exception as e:
-        print(f"[orchestrator] Failed to fetch PR diff: {e}")
+        log.warning(f"[orchestrator] Failed to fetch PR diff: {e}")
         return ""
 
 
@@ -166,54 +275,99 @@ def _get_commit_files(sha: str, repo: str = None) -> list:
         resp.raise_for_status()
         return resp.json().get("files", [])
     except Exception as e:
-        print(f"[orchestrator] Failed to fetch commit {sha[:8]} for {_repo}: {e}")
+        log.warning(f"[orchestrator] Failed to fetch commit {sha[:8]} for {_repo}: {e}")
         return []
+
+
+# ── Routing — filter features to only affected domains ───────────────────────
+
+def _filter_features_by_impact(features: list, impact_map: dict) -> list:
+    """
+    Use the impact map to keep only features whose domain is in the affected list.
+    Falls back to all features if impact map is empty (no .perf/mappings.yaml).
+    """
+    affected_domains = impact_map.get("changed_domains", [])
+    if not affected_domains:
+        return features  # no mapping — process everything
+
+    filtered = []
+    for f in features:
+        path_lower = f.path.lower()
+        # Check if any affected domain keyword appears in the endpoint path
+        for domain in affected_domains:
+            domain_keyword = domain.replace("-domain", "").lower()
+            if domain_keyword in path_lower or domain_keyword in f.file.lower():
+                filtered.append(f)
+                break
+        else:
+            # Also include if the file itself is in the affected k6 list
+            k6_affected = impact_map.get("test_updates_needed", {}).get("k6", [])
+            if any(kw in path_lower for kw in k6_affected):
+                filtered.append(f)
+
+    log.info(
+        f"[orchestrator] Routing: {len(features)} features → "
+        f"{len(filtered)} after domain filter (domains: {affected_domains})"
+    )
+    return filtered if filtered else features  # never return empty — fallback to all
+
+
+def _should_skip_change(changed_files: list, policy: PerfPolicy) -> bool:
+    """Return True if ALL changed files should be skipped per routing rules."""
+    if not changed_files:
+        return False
+    filenames = [f.get("filename", "") if isinstance(f, dict) else f for f in changed_files]
+    return all(should_skip_file(fn, policy) for fn in filenames if fn)
 
 
 # ── Auto-fix pre-existing failures ───────────────────────────────────────────
 
 def _fix_failing_scripts(pre_health: HealthReport) -> List[str]:
     """
-    For each script that was FAILING before this commit, ask GPT to fix it.
-    Returns list of script paths that were successfully fixed.
+    For each script failing before this commit, ask GPT to fix it.
+    Returns list of script paths successfully fixed.
     """
     from agent.script_generator import (
-        _openai_available, _k6_template, _inject_options_if_missing,
-        _validate_and_fix_k6, _write, MAX_FIX_ITERATIONS,
+        _openai_available, _inject_options_if_missing, _write,
     )
     from agent.code_change_detector import FeatureChange
     from openai import OpenAI
-    import os
 
     fixed = []
     if not pre_health.failing:
         return fixed
 
-    print(f"[orchestrator] Auto-fixing {len(pre_health.failing)} pre-existing failures...")
+    if not _openai_available():
+        log.info("[orchestrator] No OpenAI key — skipping auto-fix")
+        return fixed
 
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY")) if _openai_available() else None
+    log.info(f"[orchestrator] Auto-fixing {len(pre_health.failing)} pre-existing failures...")
+    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    skill_context = ""
+    skill = _get_scripting_skill()
+    if skill and "## What You Must Never Do" in skill:
+        skill_context = (
+            "\nStandards: export const options, IS_REAL_APP guard, "
+            "check(), sleep(1), domain tags required.\n"
+        )
 
     for sr in pre_health.failing:
         path = sr.path
         if not os.path.exists(path) or not path.endswith(".js"):
             continue
-        print(f"[orchestrator] Fixing pre-existing failure: {os.path.basename(path)}")
-
-        if not client:
-            print(f"[orchestrator] No OpenAI key — skipping fix for {path}")
-            continue
-
+        log.info(f"[orchestrator] Fixing: {os.path.basename(path)}")
         try:
             current = open(path, encoding="utf-8").read()
             resp = client.chat.completions.create(
                 model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
-                messages=[{"role": "user", "content": f"""Fix this failing k6 script.
-Error: {sr.error[:1000]}
-Requirements: valid k6 API, export const options, export default function,
-__ENV.SFCC_SITE_URL fallback to 'https://test.k6.io', IS_REAL_APP guard,
-status 200/201 checks, sleep(1). Return ONLY JS, no fences.
----
-{current}"""}],
+                messages=[{"role": "user", "content": (
+                    f"Fix this failing k6 script.\n"
+                    f"Error: {sr.error[:1000]}\n"
+                    f"Requirements: valid k6 API, export const options, export default function, "
+                    f"__ENV.SFCC_SITE_URL fallback to 'https://test.k6.io', IS_REAL_APP guard, "
+                    f"status 200/201 checks, sleep(1). Return ONLY JS, no fences.\n"
+                    f"{skill_context}---\n{current}"
+                )}],
                 temperature=0,
             )
             fixed_content = _inject_options_if_missing(
@@ -222,34 +376,115 @@ status 200/201 checks, sleep(1). Return ONLY JS, no fences.
             )
             _write(path, fixed_content)
 
-            # Quick validation
             from agent.script_health_checker import _run_one, _resolve_target
             target = _resolve_target()
             if target:
                 result = _run_one(path, target)
                 if result.status == "passing":
-                    print(f"[orchestrator] ✅ Fixed: {os.path.basename(path)}")
+                    log.info(f"[orchestrator] ✅ Fixed: {os.path.basename(path)}")
                     fixed.append(os.path.basename(path))
                 else:
-                    print(f"[orchestrator] ⚠️  Still failing after fix: {os.path.basename(path)}")
+                    log.warning(f"[orchestrator] ⚠️ Still failing: {os.path.basename(path)}")
             else:
-                fixed.append(os.path.basename(path))  # can't verify, assume fixed
+                fixed.append(os.path.basename(path))
         except Exception as e:
-            print(f"[orchestrator] Fix failed for {path}: {e}")
+            log.error(f"[orchestrator] Fix failed for {path}: {e}")
 
     return fixed
 
 
-# ── Full repo scan (first boot, no scripts exist) ────────────────────────────
+# ── Single-commit processing ──────────────────────────────────────────────────
+
+def _process_commit(
+    sha: str,
+    pre_health: HealthReport,
+    impact_map: dict,
+    repo: str = None,
+    env: str = None,
+) -> dict:
+    _repo = repo or GITHUB_REPO
+    _env  = env  or ENV
+    policy = _get_policy()
+
+    log.info(f"[orchestrator] Processing commit {sha[:8]} for {_repo}")
+    changed_files = _get_commit_files(sha, _repo)
+
+    if not changed_files:
+        entry = {
+            "scripts_created": [], "scripts_updated": [],
+            "dependency_changes": [], "feature_changes": [],
+            "summary": "No changed files.",
+        }
+        save_checkpoint(_repo, sha, entry)
+        return entry
+
+    # ── Routing: skip docs-only commits ──────────────────────────────────────
+    if _should_skip_change(changed_files, policy):
+        log.info(f"[orchestrator] {sha[:8]}: docs/config only — skipping per routing rules")
+        entry = {
+            "scripts_created": [], "scripts_updated": [],
+            "dependency_changes": [], "feature_changes": [],
+            "summary": "Skipped — docs/config only change per .perf/rules/commit-routing.md",
+        }
+        save_checkpoint(_repo, sha, entry)
+        return entry
+
+    change_report = detect_changes("", changed_files)
+    scripts_created, scripts_updated, generated, patches = [], [], [], []
+
+    if change_report.has_feature_changes:
+        # ── Policy routing: only generate for affected domains ────────────────
+        features_to_generate = _filter_features_by_impact(
+            change_report.feature_changes, impact_map
+        )
+        log.info(
+            f"[orchestrator] {sha[:8]}: {len(features_to_generate)} feature(s) "
+            f"to generate for {_repo}"
+        )
+        generated = generate_all(features_to_generate, env=_env, repo=_repo)
+        pre_paths = {r.path for r in pre_health.results}
+        for gs in generated:
+            if gs.k6_path in pre_paths:
+                scripts_updated += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+            else:
+                scripts_created += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+    else:
+        log.info(f"[orchestrator] {sha[:8]}: no feature changes detected")
+
+    if change_report.needs_action:
+        patches = patch_all(change_report, repo=_repo)
+        scripts_updated += [r.file for r in patches if r.patched]
+
+    summary = f"Created {len(scripts_created)} scripts; updated {len(scripts_updated)} scripts."
+    log.info(f"[orchestrator] {sha[:8]}: {summary}")
+
+    entry = {
+        "scripts_created": scripts_created,
+        "scripts_updated": scripts_updated,
+        "dependency_changes": [
+            {"package": d.package, "old": d.old_version, "new": d.new_version}
+            for d in change_report.dependency_changes
+        ],
+        "feature_changes": [
+            {"method": f.method, "path": f.path} for f in change_report.feature_changes
+        ],
+        "summary": summary,
+    }
+    save_checkpoint(_repo, sha, entry)
+    return {
+        "change_report": change_report,
+        "generated": generated,
+        "patches": patches,
+        "entry": entry,
+    }
+
+
+# ── Full repo scan (first boot) ───────────────────────────────────────────────
 
 def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
     """
-    Walk every commit in the repo history (oldest → newest), run
-    detect_changes on each commit's diff, accumulate all unique endpoints
-    and dependency changes, then generate scripts once per unique endpoint.
-
-    Called once on first boot when no scripts and no checkpoint exist.
-    Saves a checkpoint at HEAD so this never runs again on restart.
+    Walk every commit in repo history, accumulate unique endpoints,
+    generate scripts once. Called once on first boot.
     """
     result = OrchestrationResult()
     _repo = repo or GITHUB_REPO
@@ -259,18 +494,14 @@ def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
         result.error = "GITHUB_REPO not set"
         return result
 
-    print(f"[orchestrator] Full commit-history scan — {_repo}")
+    log.info(f"[orchestrator] Full commit-history scan — {_repo}")
 
-    # 1. Fetch all commits (oldest first, paginated)
-    all_commits = []
-    page = 1
+    all_commits, page = [], 1
     while True:
         try:
             r = requests.get(
                 f"https://api.github.com/repos/{_repo}/commits",
-                headers=HEADERS,
-                params={"per_page": 100, "page": page},
-                timeout=30,
+                headers=HEADERS, params={"per_page": 100, "page": page}, timeout=30,
             )
             r.raise_for_status()
             batch = r.json()
@@ -288,45 +519,32 @@ def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
         result.error = "No commits found in repo"
         return result
 
-    # oldest → newest
     all_commits.reverse()
     head_sha = all_commits[-1]["sha"]
-    print(f"[orchestrator] {len(all_commits)} commits to scan (oldest→newest), HEAD={head_sha[:8]}")
+    log.info(f"[orchestrator] {len(all_commits)} commits, HEAD={head_sha[:8]}")
 
-    # 2. Walk each commit, accumulate unique features + dep changes
-    from agent.code_change_detector import detect_changes, FeatureChange, DependencyChange
-
+    from agent.code_change_detector import FeatureChange, DependencyChange
     seen_endpoints: set = set()
-    all_features:   list[FeatureChange]    = []
-    all_dep_changes: list[DependencyChange] = []
+    all_features: List[FeatureChange] = []
+    all_dep_changes: List[DependencyChange] = []
 
     for idx, commit in enumerate(all_commits, 1):
         sha = commit["sha"]
-        msg = commit.get("commit", {}).get("message", "")[:60]
-        print(f"[orchestrator] [{idx}/{len(all_commits)}] {sha[:8]} — {msg}")
-
         changed_files = _get_commit_files(sha)
         if not changed_files:
             continue
-
         report = detect_changes("", changed_files)
-
-        # Accumulate dependency changes (all of them, no dedup needed)
         all_dep_changes.extend(report.dependency_changes)
-
-        # Deduplicate endpoints by (method, path) — keep first occurrence
         for f in report.feature_changes:
             key = (f.method, f.path)
             if key not in seen_endpoints:
                 seen_endpoints.add(key)
                 all_features.append(f)
-                print(f"[orchestrator]   + {f.method} {f.path} ({f.file})")
 
-    print(f"[orchestrator] Scan complete — {len(all_features)} unique endpoints, "
-          f"{len(all_dep_changes)} dep changes across {len(all_commits)} commits")
+    log.info(f"[orchestrator] Scan: {len(all_features)} unique endpoints")
 
     if not all_features:
-        result.summary = "No endpoints detected across commit history — no scripts generated."
+        result.summary = "No endpoints detected — no scripts generated."
         save_checkpoint(_repo, head_sha, {
             "scripts_created": [], "scripts_updated": [],
             "dependency_changes": [], "feature_changes": [],
@@ -334,11 +552,7 @@ def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
         })
         return result
 
-    # 3. Generate scripts for all unique endpoints (create or update, no blind overwrite)
-    print(f"[orchestrator] Generating scripts for {len(all_features)} endpoints...")
     result.generated_scripts = generate_all(all_features, env=_env, repo=_repo)
-
-    # 4. Save checkpoint at HEAD — prevents re-scan on next restart
     created_paths = []
     for gs in result.generated_scripts:
         created_paths += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
@@ -352,73 +566,15 @@ def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
         ],
         "feature_changes": [{"method": f.method, "path": f.path} for f in all_features],
         "summary": (
-            f"Full history scan: {len(all_commits)} commits, "
-            f"{len(all_features)} endpoints, {len(created_paths)} scripts generated."
+            f"Full scan: {len(all_commits)} commits, "
+            f"{len(all_features)} endpoints, {len(created_paths)} scripts."
         ),
     })
-
     result.summary = (
-        f"Full history scan: {len(all_commits)} commits scanned, "
-        f"{len(all_features)} unique endpoints found, "
-        f"{len(result.generated_scripts) * 3} scripts generated."
+        f"Full scan: {len(all_commits)} commits, "
+        f"{len(all_features)} endpoints, {len(result.generated_scripts) * 3} scripts generated."
     )
-    print(f"[orchestrator] {result.summary}")
     return result
-
-
-# ── Single-commit processing ──────────────────────────────────────────────────
-
-def _process_commit(sha: str, pre_health: HealthReport, repo: str = None, env: str = None) -> dict:
-    _repo = repo or GITHUB_REPO
-    _env  = env  or ENV
-    print(f"[orchestrator] Processing commit {sha[:8]} for {_repo}")
-    changed_files = _get_commit_files(sha, _repo)
-
-    if not changed_files:
-        entry = {
-            "scripts_created": [], "scripts_updated": [],
-            "dependency_changes": [], "feature_changes": [],
-            "summary": "No changed files.",
-        }
-        save_checkpoint(_repo, sha, entry)
-        return entry
-
-    change_report = detect_changes("", changed_files)
-    scripts_created, scripts_updated, generated, patches = [], [], [], []
-
-    if change_report.has_feature_changes:
-        print(f"[orchestrator] {len(change_report.feature_changes)} feature(s) detected in {_repo}")
-        generated = generate_all(change_report.feature_changes, env=_env, repo=_repo)
-        for gs in generated:
-            pre_paths = {r.path for r in pre_health.results}
-            if gs.k6_path in pre_paths:
-                scripts_updated += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
-            else:
-                scripts_created += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
-    else:
-        print(f"[orchestrator] {sha[:8]}: no Scenario A/B changes — checkpoint anchored, no scripts generated")
-
-    if change_report.needs_action:
-        patches = patch_all(change_report, repo=_repo)
-        scripts_updated += [r.file for r in patches if r.patched]
-
-    summary = f"Created {len(scripts_created)} scripts; updated {len(scripts_updated)} scripts."
-    print(f"[orchestrator] {sha[:8]}: {summary}")
-
-    entry = {
-        "scripts_created": scripts_created,
-        "scripts_updated": scripts_updated,
-        "dependency_changes": [
-            {"package": d.package, "old": d.old_version, "new": d.new_version}
-            for d in change_report.dependency_changes
-        ],
-        "feature_changes": [{"method": f.method, "path": f.path}
-                             for f in change_report.feature_changes],
-        "summary": summary,
-    }
-    save_checkpoint(_repo, sha, entry)
-    return {"change_report": change_report, "generated": generated,
-            "patches": patches, "entry": entry}
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -427,55 +583,80 @@ def orchestrate(
     pr_number: Optional[int] = None,
     commit_sha: Optional[str] = None,
     repo: Optional[str] = None,
+    impact_map: Optional[dict] = None,
 ) -> OrchestrationResult:
     """
-    Full pipeline:
-      PRE check → fix failures → detect → generate/patch → POST check → checkpoint
+    Full policy-driven pipeline.
+    impact_map is built by the webhook handler from .perf/mappings.yaml
+    and passed in — orchestrator never re-builds it (no tight coupling).
     """
     result = OrchestrationResult()
-    _repo = repo or GITHUB_REPO
-    _env  = ENV
+    _repo  = repo or GITHUB_REPO
+    _env   = ENV
+    policy = _get_policy()
+    _impact_map = impact_map or {}
+    result.impact_map = _impact_map
+
+    # Determine execution profile from trigger type
+    trigger = "pull_request" if pr_number else "push"
+    profile = get_profile(trigger, policy)
 
     if not _repo:
         result.error = "GITHUB_REPO env var not set"
         return result
 
     # ── Step 1: PRE health check ──────────────────────────────────────────────
-    print(f"[orchestrator] Running PRE health check for {_repo}...")
+    log.info(f"[orchestrator] PRE health check — {_repo}")
     pre_health = run_pre_check(_repo, _env)
     result.pre_health = pre_health
 
-    # ── Step 2: Fix any pre-existing failures ─────────────────────────────────
+    # ── Step 2: Fix pre-existing failures ────────────────────────────────────
     if pre_health.failing:
         result.scripts_fixed = _fix_failing_scripts(pre_health)
 
     # ── PR event ──────────────────────────────────────────────────────────────
     if pr_number:
-        print(f"[orchestrator] Processing PR #{pr_number} for {_repo}")
-        changed_files = _get_pr_files(pr_number)
-        diff_text     = _get_pr_diff(pr_number)
+        log.info(f"[orchestrator] PR #{pr_number} — {_repo}")
+        changed_files = _get_pr_files(pr_number, _repo)
+        diff_text     = _get_pr_diff(pr_number, _repo)
 
         if not changed_files:
             result.summary = "No changed files in PR."
+        elif _should_skip_change(changed_files, policy):
+            result.summary = "Skipped — docs/config only change."
+            log.info(f"[orchestrator] PR #{pr_number}: skipped per routing rules")
         else:
+            # Build impact map from PR files if not provided by caller
+            if not _impact_map:
+                filenames = [f.get("filename", "") for f in changed_files]
+                _impact_map = build_impact_map(filenames, policy)
+                result.impact_map = _impact_map
+
             change_report = detect_changes(diff_text, changed_files)
             result.change_report = change_report
 
             if change_report.has_feature_changes:
-                result.generated_scripts = generate_all(
-                    change_report.feature_changes, env=_env, repo=_repo
+                features = _filter_features_by_impact(
+                    change_report.feature_changes, _impact_map
                 )
+                result.generated_scripts = generate_all(features, env=_env, repo=_repo)
+
             if change_report.needs_action:
                 result.patch_results = patch_all(change_report, repo=_repo)
 
             n_gen   = len(result.generated_scripts)
             n_patch = sum(1 for r in result.patch_results if r.patched)
-            result.summary = f"PR #{pr_number}: generated {n_gen * 3} scripts; patched {n_patch}."
+            result.summary = (
+                f"PR #{pr_number}: {n_gen * 3} scripts generated/updated; "
+                f"{n_patch} patched. Risk: {_impact_map.get('risk_level', 'unknown')}."
+            )
             result.commits_processed = [f"PR#{pr_number}"]
 
-        # POST check
-        print(f"[orchestrator] Running POST health check for {_repo}...")
+        # POST check + merge gate
+        log.info(f"[orchestrator] POST health check — {_repo}")
         result.post_health = run_post_check(_repo, _env)
+        result.merge_gate  = _evaluate_merge_gate(result.post_health, _impact_map, profile)
+        log.info(f"[orchestrator] Merge gate: {result.merge_gate.status} — {result.merge_gate.reason}")
         return result
 
     # ── Push event ────────────────────────────────────────────────────────────
@@ -484,13 +665,16 @@ def orchestrate(
         return result
 
     checkpoint = get_checkpoint(_repo)
-    print(f"[orchestrator] Push on {_repo} — current: {commit_sha[:8]}, "
-          f"checkpoint: {checkpoint[:8] if checkpoint else 'none'}")
+    log.info(
+        f"[orchestrator] Push — {_repo} commit={commit_sha[:8]}, "
+        f"checkpoint={checkpoint[:8] if checkpoint else 'none'}"
+    )
 
     shas = get_unprocessed_commits(_repo, commit_sha, HEADERS)
     if not shas:
         result.summary = "All commits already processed."
         result.post_health = run_post_check(_repo, _env)
+        result.merge_gate  = _evaluate_merge_gate(result.post_health, _impact_map, profile)
         return result
 
     all_generated: List[GeneratedScripts] = []
@@ -498,7 +682,7 @@ def orchestrate(
     last_report:   Optional[ChangeReport] = None
 
     for sha in shas:
-        out = _process_commit(sha, pre_health, repo=_repo, env=_env)
+        out = _process_commit(sha, pre_health, _impact_map, repo=_repo, env=_env)
         result.commits_processed.append(sha)
         if isinstance(out, dict) and "change_report" in out:
             last_report = out["change_report"]
@@ -509,19 +693,20 @@ def orchestrate(
     result.generated_scripts = all_generated
     result.patch_results     = all_patches
 
-    # ── Step 6: POST health check ─────────────────────────────────────────────
-    print(f"[orchestrator] Running POST health check for {_repo}...")
+    # POST check + merge gate
+    log.info(f"[orchestrator] POST health check — {_repo}")
     result.post_health = run_post_check(_repo, _env)
+    result.merge_gate  = _evaluate_merge_gate(result.post_health, _impact_map, profile)
 
-    total_created = len([gs for gs in all_generated])
+    total_gen     = len(all_generated)
     total_patched = sum(1 for r in all_patches if r.patched)
     post_fail     = len(result.post_health.failing)
 
     result.summary = (
         f"Processed {len(shas)} commit(s) on {_repo}; "
-        f"created/updated {total_created * 3} scripts; "
-        f"patched {total_patched}; "
-        f"post-check: {len(result.post_health.passing)} passing, {post_fail} failing."
+        f"{total_gen * 3} scripts; {total_patched} patched; "
+        f"post-check: {len(result.post_health.passing)} passing, {post_fail} failing; "
+        f"gate: {result.merge_gate.status}."
     )
-    print(f"[orchestrator] Done. {result.summary}")
+    log.info(f"[orchestrator] Done. {result.summary}")
     return result

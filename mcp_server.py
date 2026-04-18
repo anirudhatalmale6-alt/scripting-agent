@@ -60,6 +60,26 @@ TOOL_REGISTRY = {
         "description": "Run all k6 + Selenium scripts for a repo/env. AI fixes failures automatically, only flags what truly needs manual review.",
         "input": {"repo": "string (optional)", "env": "string (optional, default: dev)"},
     },
+    "generate_scripts": {
+        "description": "Generate or update k6/Selenium/LoadRunner scripts for changed endpoints using policy rules from .perf/",
+        "input": {
+            "changed_files": "list of changed file paths (required)",
+            "repo":          "string (optional)",
+            "env":           "string (optional, default: dev)",
+        },
+    },
+    "get_impact_map": {
+        "description": "Return which test domains and scripts are affected by a set of changed files, using .perf/mappings.yaml",
+        "input": {"changed_files": "list of changed file paths (required)"},
+    },
+    "compare_with_baseline": {
+        "description": "Compare current run metrics against stored baseline and classify regression",
+        "input": {
+            "current":  "dict with latency and error_rate keys (required)",
+            "previous": "dict with latency and error_rate keys (required)",
+            "domain":   "string — domain name for threshold lookup (optional, default: default)",
+        },
+    },
     "grafana": {
         "description": "Fetch Grafana dashboards list or a specific dashboard by UID",
         "input": {"uid": "string (optional — omit to list all dashboards)"},
@@ -232,15 +252,94 @@ def _handle_slack(params: dict) -> dict:
         return {"error": str(e)}
 
 
+def _handle_generate_scripts(params: dict) -> dict:
+    """Generate/update k6+Selenium+LR scripts for a list of changed files."""
+    try:
+        from agent.code_change_detector import detect_changes
+        from agent.script_generator import generate_all
+        from agent.perf_policy import load_policy, build_impact_map
+
+        changed_files = params.get("changed_files", [])
+        repo = params.get("repo", os.getenv("GITHUB_REPOS", "").split(",")[0].strip())
+        env  = params.get("env", os.getenv("ENV", "dev"))
+
+        if not changed_files:
+            return {"status": "skipped", "reason": "No changed_files provided"}
+
+        # Build impact map first
+        policy = load_policy()
+        file_dicts = [{"filename": f, "status": "modified", "patch": ""} for f in changed_files]
+        impact = build_impact_map(changed_files, policy)
+
+        # Detect feature changes from diffs
+        change_report = detect_changes("", file_dicts)
+        features = change_report.feature_changes
+
+        if not features:
+            return {
+                "status": "no_features_detected",
+                "impact_map": impact,
+                "message": "No new endpoints detected in changed files",
+            }
+
+        results = generate_all(features, env=env, repo=repo)
+        return {
+            "status": "ok",
+            "scripts_generated": len(results),
+            "impact_map": impact,
+            "scripts": [
+                {"k6": r.k6_path, "selenium": r.selenium_path,
+                 "loadrunner": r.loadrunner_path, "validated": r.k6_validated}
+                for r in results
+            ],
+        }
+    except Exception as e:
+        log.error(f"[mcp] generate_scripts error: {e}")
+        return {"error": str(e)}
+
+
+def _handle_get_impact_map(params: dict) -> dict:
+    """Return impact map for a list of changed files using .perf/mappings.yaml."""
+    try:
+        from agent.perf_policy import load_policy, build_impact_map
+        changed_files = params.get("changed_files", [])
+        if not changed_files:
+            return {"status": "skipped", "reason": "No changed_files provided"}
+        policy = load_policy()
+        if not policy.loaded:
+            return {"status": "skipped", "reason": ".perf/mappings.yaml not found"}
+        impact = build_impact_map(changed_files, policy)
+        return {"status": "ok", "impact_map": impact}
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _handle_compare_with_baseline(params: dict) -> dict:
+    """Compare current vs previous run metrics using policy thresholds."""
+    try:
+        from regression_detector import detect_regression
+        current  = params.get("current",  {})
+        previous = params.get("previous", {})
+        domain   = params.get("domain", "default")
+        if not current or not previous:
+            return {"status": "skipped", "reason": "current and previous metrics required"}
+        return detect_regression(previous, current, domain=domain)
+    except Exception as e:
+        return {"error": str(e)}
+
+
 _HANDLERS = {
-    "k6":             _handle_k6,
-    "run_tests":      _handle_run_tests,
-    "grafana":        _handle_grafana,
-    "jira":           _handle_jira,
-    "datadog":        _handle_datadog,
-    "speedcurve":     _handle_speedcurve,
-    "github_commits": _handle_github_commits,
-    "slack":          _handle_slack,
+    "k6":                    _handle_k6,
+    "run_tests":             _handle_run_tests,
+    "generate_scripts":      _handle_generate_scripts,
+    "get_impact_map":        _handle_get_impact_map,
+    "compare_with_baseline": _handle_compare_with_baseline,
+    "grafana":               _handle_grafana,
+    "jira":                  _handle_jira,
+    "datadog":               _handle_datadog,
+    "speedcurve":            _handle_speedcurve,
+    "github_commits":        _handle_github_commits,
+    "slack":                 _handle_slack,
 }
 
 

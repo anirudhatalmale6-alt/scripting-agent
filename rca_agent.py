@@ -31,6 +31,8 @@ from flask import Flask, jsonify, request
 from openai import OpenAI
 
 from agent.mcp_client import call_tool
+from agent.perf_policy import load_policy, get_thresholds, get_profile, load_agent_skill, PerfPolicy
+from typing import Optional
 from email_service import send_email
 from report_writer import write_report
 from slack_service import send_slack
@@ -54,7 +56,6 @@ logging.basicConfig(
 log = logging.getLogger("rca_agent")
 
 # ── Config ────────────────────────────────────────────────────────────────────
-load_dotenv()
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
 OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
@@ -67,6 +68,32 @@ GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
 GITHUB_TOKEN    = os.getenv("GITHUB_TOKEN")
 MCP_URL         = os.getenv("MCP_URL")
 TOKEN           = os.getenv("TOKEN")
+
+# ── Cached policy ────────────────────────────────────────────────────────────
+_rca_policy: Optional[PerfPolicy] = None
+
+
+def _get_rca_policy() -> PerfPolicy:
+    global _rca_policy
+    if _rca_policy is None:
+        _rca_policy = load_policy()
+    return _rca_policy
+_exec_skill: str = ""
+_platform_skill: str = ""
+
+
+def _get_exec_skill() -> str:
+    global _exec_skill
+    if not _exec_skill:
+        _exec_skill = load_agent_skill("PERF_EXEC_AGENT.md")
+    return _exec_skill
+
+
+def _get_platform_skill() -> str:
+    global _platform_skill
+    if not _platform_skill:
+        _platform_skill = load_agent_skill("PERF_AGENTS.md")
+    return _platform_skill
 
 client = None
 
@@ -107,7 +134,9 @@ def get_heap_snapshot():
         return {"error": str(e)}
 
 def detect_latency_anomaly():
-    return {"p95_threshold": 200, "status": "within limits"}
+    policy = _get_rca_policy()
+    default_p95 = policy.thresholds.get("default").p95_ms if policy.loaded and "default" in policy.thresholds else 2000
+    return {"p95_threshold": default_p95, "status": "within limits"}
 
 def detect_memory_trend():
     mem = psutil.virtual_memory().percent
@@ -184,14 +213,39 @@ def ai_analysis(data):
         c = _get_openai_client()
         if not c:
             return "AI unavailable — OPENAI_API_KEY not configured."
-        prompt = f"""You are a performance engineer.
-Analyze system data. Focus on: Failed APIs, Slow transactions, Errors (401, 500), Infra issues.
+
+        # Load agent skill file as system prompt — drives agent behaviour
+        exec_skill = _get_exec_skill()
+        platform_skill = _get_platform_skill()
+
+        system_prompt = "You are a performance engineering expert."
+        if exec_skill:
+            # Use the RCA-specific sections as the system prompt
+            system_prompt = exec_skill
+        elif platform_skill:
+            system_prompt = platform_skill
+
+        # Inject policy regression rules into the user prompt
+        policy = _get_rca_policy()
+        policy_context = ""
+        if policy.loaded and policy.regression_rules:
+            policy_context = (
+                f"\n## Regression thresholds from repo policy:\n"
+                f"{policy.regression_rules[:600]}\n"
+            )
+
+        prompt = f"""Analyze the following performance data.
+Focus on: Failed APIs, Slow transactions, Errors (401, 500), Infra issues.
+Classify regression as: no_regression / minor_regression / severe_regression.
+Provide: likely cause (1 sentence) + recommendation (1 sentence).
+{policy_context}
 Detected Issues: {data['issues']}
 Performance Data: {data}"""
+
         resp = c.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[
-                {"role": "system", "content": "You are a performance engineering expert."},
+                {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": prompt},
             ],
             temperature=0.2,

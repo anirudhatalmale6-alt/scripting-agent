@@ -1,12 +1,7 @@
-def detect_regression(old_latency, new_latency):
-
-    if new_latency > old_latency * 1.2:
-
-        return {
-            "regression": True,
-            "reason": "Latency increased"
-        }
-
-    return {
-        "regression": False
-    }
+"""
+agent/rca.py
+────────────
+Thin wrapper — delegates to regression_engine for policy-driven detection.
+Kept for backward compatibility with any callers using agent.rca.detect_regression.
+"""
+from agent.regression_engine import detect_regression  # noqa: F401

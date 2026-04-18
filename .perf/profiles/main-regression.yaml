@@ -1,0 +1,20 @@
+name: main_regression
+triggers:
+  - merge_main
+
+k6:
+  vus: 30
+  duration: "5m"
+  scenarios: regression
+
+selenium:
+  suite: critical-regression
+  browser: chrome
+  headless: true
+
+loadrunner:
+  enabled: false
+
+baseline:
+  update_on_green: true
+  window: last_10_green_runs

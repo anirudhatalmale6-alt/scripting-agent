@@ -1,0 +1,22 @@
+name: pr_smoke
+triggers:
+  - pull_request
+  - push
+
+k6:
+  vus: 10
+  duration: "30s"
+  scenarios: smoke
+
+selenium:
+  suite: critical-smoke
+  browser: chrome
+  headless: true
+
+loadrunner:
+  enabled: false
+
+merge_gate:
+  warn_on_regression_pct: 20
+  block_on_regression_pct: 50
+  block_on_critical_flow_failure: true

@@ -15,6 +15,7 @@ import traceback
 import gc
 # from email_service import connect, send_email
 from tools.openspec import get_tools
+from agent.perf_policy import load_policy, build_impact_map, get_profile, should_skip_file
 
 import hmac
 import hashlib
@@ -404,6 +405,34 @@ def get_git_diff():
     except Exception as e:
         print("❌ Git Diff Error:", str(e))
         return {"error": str(e)}
+
+
+# --------------------------------
+# POLICY-DRIVEN IMPACT MAP
+# --------------------------------
+
+def build_pr_impact_map(changed_files: list) -> dict:
+    """
+    Use .perf/mappings.yaml to determine which test domains are affected
+    by the changed files. Returns a structured impact map.
+    Falls back gracefully if .perf/ is not present.
+    """
+    try:
+        policy = load_policy()
+        if not policy.loaded:
+            print("[webhook] No .perf/ policy found — skipping impact mapping")
+            return {}
+        file_paths = [f.get("filename", "") for f in changed_files if f.get("filename")]
+        impact = build_impact_map(file_paths, policy)
+        print(f"[webhook] Impact map: domains={impact['changed_domains']}, "
+              f"risk={impact['risk_level']}, "
+              f"k6={impact['test_updates_needed']['k6']}")
+        return impact
+    except Exception as e:
+        print(f"[webhook] Impact map error: {e}")
+        return {}
+
+
 # --------------------------------
 # ROOT CAUSE DATA
 # --------------------------------
@@ -832,9 +861,27 @@ def github_push():
         print("🚀 Running AI Agent...")
 
         # --------------------------------
+        # Build policy-driven impact map
+        # --------------------------------
+        changed_files = []
+        if "commits" in payload:
+            for commit in payload.get("commits", []):
+                for f in commit.get("added", []) + commit.get("modified", []):
+                    changed_files.append({"filename": f})
+        elif "pull_request" in payload:
+            # For PR events, files come from the diff API — best effort from payload
+            changed_files = payload.get("pull_request", {}).get("changed_files_list", [])
+
+        impact_map = build_pr_impact_map(changed_files) if changed_files else {}
+
+        # --------------------------------
         # Run Agent
         # --------------------------------
         result = run_agent()
+
+        # Attach impact map to result
+        if impact_map:
+            result["impact_map"] = impact_map
 
         # --------------------------------
         # Post PR Comment (if PR)

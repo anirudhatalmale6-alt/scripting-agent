@@ -28,6 +28,7 @@ from flask import Flask, jsonify, request
 from agent.commit_tracker import get_checkpoint, get_full_report
 from agent.concurrency import WebhookQueue
 from agent.test_orchestrator import orchestrate
+from agent.perf_policy import load_policy, build_impact_map, should_skip_file
 from github_reporting import comment_pr
 from slack_service import send_slack
 
@@ -84,10 +85,46 @@ def github_webhook():
     if not pr_number and not commit_sha:
         return jsonify({"message": "No PR or commit in payload"}), 200
 
+    # ── Policy-driven impact map ──────────────────────────────────────────────
+    changed_files = []
+    for commit in payload.get("commits", []):
+        changed_files += commit.get("added", []) + commit.get("modified", [])
+    if not changed_files and "pull_request" in payload:
+        changed_files = [
+            f.get("filename", "") for f in
+            payload.get("pull_request", {}).get("changed_files_list", [])
+        ]
+
+    impact_map = {}
+    if changed_files:
+        try:
+            policy = load_policy()
+            if policy.loaded:
+                impact_map = build_impact_map(changed_files, policy)
+                log.info(
+                    f"[webhook] Impact: domains={impact_map.get('changed_domains')}, "
+                    f"risk={impact_map.get('risk_level')}, "
+                    f"k6={impact_map.get('test_updates_needed', {}).get('k6')}"
+                )
+                # Skip if all files are docs/config with no test impact
+                if not impact_map.get("changed_domains") and not impact_map.get("test_updates_needed", {}).get("k6"):
+                    all_skipped = all(should_skip_file(f, policy) for f in changed_files if f)
+                    if all_skipped:
+                        log.info("[webhook] All changed files skipped per routing rules")
+                        return jsonify({"message": "Skipped — docs/config only change"}), 200
+        except Exception as e:
+            log.warning(f"[webhook] Impact map failed: {e}")
+
     log.info(f"[webhook] Received from {event_repo} — PR: {pr_number}, "
              f"commit: {str(commit_sha)[:8] if commit_sha else None}")
 
-    future = _queue.submit(orchestrate, pr_number=pr_number, commit_sha=commit_sha, repo=event_repo)
+    future = _queue.submit(
+        orchestrate,
+        pr_number=pr_number,
+        commit_sha=commit_sha,
+        repo=event_repo,
+        impact_map=impact_map,   # pass policy-driven routing into orchestrator
+    )
 
     try:
         result = future.result(timeout=600)
@@ -122,8 +159,10 @@ def github_webhook():
     # Slack notification
     if SLACK_WEBHOOK and "xxxx" not in SLACK_WEBHOOK:
         try:
-            pre  = result.pre_health
-            post = result.post_health
+            pre   = result.pre_health
+            post  = result.post_health
+            gate  = result.merge_gate
+            gate_icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(gate.status, "ℹ️")
             health_line = ""
             if pre and post:
                 health_line = (
@@ -131,14 +170,25 @@ def github_webhook():
                     f"\nPOST: {len(post.passing)} passing, {len(post.failing)} failing"
                     + (" ✅ All clear" if len(post.failing) == 0 else " ⚠️ Failures remain")
                 )
-            send_slack(f"🧪 *Test Trigger Agent*\n{result.summary}{health_line}\n\n{md[:400]}")
+            send_slack(
+                f"🧪 *Test Trigger Agent*\n{result.summary}"
+                f"\n{gate_icon} Merge gate: *{gate.status.upper()}* — {gate.reason}"
+                f"{health_line}\n\n{md[:400]}"
+            )
         except Exception as e:
             log.warning(f"[webhook] Slack failed: {e}")
 
     return jsonify({
-        "message": "Test Trigger Agent executed",
+        "message":          "Test Trigger Agent executed",
         "commits_processed": result.commits_processed,
-        "summary": result.summary,
+        "summary":          result.summary,
+        "impact_map":       impact_map,
+        "merge_gate":       {
+            "status":      result.merge_gate.status,
+            "reason":      result.merge_gate.reason,
+            "block_merge": result.merge_gate.block_merge,
+            "risk_level":  result.merge_gate.risk_level,
+        },
         "report": md,
     }), 200
 

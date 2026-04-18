@@ -1,0 +1,22 @@
+name: nightly_endurance
+triggers:
+  - nightly
+
+k6:
+  vus: 75
+  duration: "30m"
+  scenarios: endurance
+
+selenium:
+  suite: expanded
+  browser: chrome,firefox
+  headless: true
+
+loadrunner:
+  enabled: true
+
+baseline:
+  update_on_green: true
+  window: last_10_green_runs
+  detect_drift: true
+  detect_flaky: true

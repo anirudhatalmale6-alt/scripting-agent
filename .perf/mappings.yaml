@@ -1,0 +1,106 @@
+mappings:
+  - name: checkout-domain
+    paths:
+      - "services/checkout/**"
+      - "web/checkout/**"
+      - "api/checkout/**"
+      - "**/checkout*"
+    affects:
+      k6:
+        - "checkout"
+      selenium:
+        - "checkout"
+      loadrunner:
+        - "checkout"
+    risk: high
+
+  - name: auth-domain
+    paths:
+      - "services/auth/**"
+      - "web/login/**"
+      - "api/auth/**"
+      - "api/login/**"
+      - "**/auth*"
+      - "**/login*"
+    affects:
+      k6:
+        - "login"
+        - "auth"
+      selenium:
+        - "login"
+    risk: high
+
+  - name: cart-domain
+    paths:
+      - "services/cart/**"
+      - "api/cart/**"
+      - "**/cart*"
+    affects:
+      k6:
+        - "cart"
+      selenium:
+        - "cart"
+    risk: medium
+
+  - name: search-domain
+    paths:
+      - "services/search/**"
+      - "web/search/**"
+      - "api/search/**"
+      - "**/search*"
+    affects:
+      k6:
+        - "search"
+      selenium:
+        - "search"
+    risk: medium
+
+  - name: order-domain
+    paths:
+      - "services/order/**"
+      - "api/order/**"
+      - "api/orders/**"
+      - "**/order*"
+    affects:
+      k6:
+        - "order"
+      loadrunner:
+        - "order"
+    risk: high
+
+  - name: product-domain
+    paths:
+      - "services/product/**"
+      - "api/product/**"
+      - "api/products/**"
+      - "**/product*"
+    affects:
+      k6:
+        - "product"
+    risk: medium
+
+  - name: user-domain
+    paths:
+      - "services/user/**"
+      - "api/user/**"
+      - "api/users/**"
+      - "**/user*"
+    affects:
+      k6:
+        - "user"
+      selenium:
+        - "user"
+    risk: medium
+
+  - name: api-contracts
+    paths:
+      - "schemas/*.yaml"
+      - "schemas/*.json"
+      - "openapi*.yaml"
+      - "openapi*.json"
+      - "swagger*.yaml"
+      - "swagger*.json"
+    affects:
+      k6:
+        - "contracts"
+    risk: medium

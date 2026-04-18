@@ -1,0 +1,69 @@
+thresholds:
+  default:
+    p95_ms: 2000
+    error_rate: 0.05
+    throughput_rps: 10
+
+  checkout:
+    p95_ms: 800
+    warn_p95_ms: 1200
+    error_rate: 0.005
+    warn_error_rate: 0.01
+    throughput_rps: 20
+    risk: high
+
+  auth:
+    p95_ms: 500
+    warn_p95_ms: 800
+    error_rate: 0.005
+    warn_error_rate: 0.01
+    throughput_rps: 30
+    risk: high
+
+  login:
+    p95_ms: 500
+    warn_p95_ms: 800
+    error_rate: 0.005
+    warn_error_rate: 0.01
+    throughput_rps: 30
+    risk: high
+
+  cart:
+    p95_ms: 600
+    warn_p95_ms: 1000
+    error_rate: 0.01
+    warn_error_rate: 0.02
+    throughput_rps: 25
+    risk: medium
+
+  search:
+    p95_ms: 700
+    warn_p95_ms: 1100
+    error_rate: 0.01
+    warn_error_rate: 0.02
+    throughput_rps: 50
+    risk: medium
+
+  order:
+    p95_ms: 800
+    warn_p95_ms: 1200
+    error_rate: 0.005
+    warn_error_rate: 0.01
+    throughput_rps: 15
+    risk: high
+
+  product:
+    p95_ms: 600
+    warn_p95_ms: 1000
+    error_rate: 0.01
+    warn_error_rate: 0.02
+    throughput_rps: 40
+    risk: medium
+
+  user:
+    p95_ms: 600
+    warn_p95_ms: 1000
+    error_rate: 0.01
+    warn_error_rate: 0.02
+    throughput_rps: 20
+    risk: medium

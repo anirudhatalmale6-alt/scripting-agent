@@ -35,6 +35,10 @@ from typing import List, Optional, Tuple
 from openai import OpenAI
 from dotenv import load_dotenv
 from agent.code_change_detector import FeatureChange
+from agent.perf_policy import (
+    PerfPolicy, ThresholdConfig,
+    load_policy, get_thresholds, get_generation_rules, get_profile, load_agent_skill,
+)
 
 load_dotenv()
 
@@ -42,6 +46,46 @@ client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 BASE_URL = os.getenv("SFCC_SITE_URL", "https://your-app.com")
 MAX_FIX_ITERATIONS = 5
+
+# ── Policy (loaded once at module level, can be overridden per call) ──────────
+_policy: Optional[PerfPolicy] = None
+_scripting_skill: Optional[str] = None
+
+
+def _get_policy() -> PerfPolicy:
+    global _policy
+    if _policy is None:
+        _policy = load_policy()
+    return _policy
+
+
+def _get_scripting_skill() -> str:
+    """Load SCRIPTING_AGENT.md once and cache it."""
+    global _scripting_skill
+    if _scripting_skill is None:
+        _scripting_skill = load_agent_skill("SCRIPTING_AGENT.md")
+    return _scripting_skill
+
+
+def set_policy(policy: PerfPolicy) -> None:
+    """Override the module-level policy (useful for testing or multi-repo runs)."""
+    global _policy
+    _policy = policy
+
+
+def _domain_from_feature(feature: FeatureChange) -> str:
+    """Infer domain name from endpoint path for threshold lookup."""
+    path = feature.path.lower()
+    for keyword in ("checkout", "auth", "login", "cart", "search", "order", "product", "user"):
+        if keyword in path:
+            return keyword
+    return "default"
+
+
+def _thresholds_for(feature: FeatureChange) -> ThresholdConfig:
+    """Return policy-driven thresholds for a feature, falling back to defaults."""
+    domain = _domain_from_feature(feature)
+    return get_thresholds(domain, _get_policy())
 
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
@@ -142,6 +186,15 @@ def _k6_template(feature: FeatureChange, env: str) -> str:
     method = feature.method.lower()
     # Replace path params with realistic placeholder values
     path_with_id = re.sub(r'\{[^}]+\}', '1', feature.path)
+    domain = _domain_from_feature(feature)
+
+    # ── Policy-driven thresholds ──────────────────────────────────────────────
+    t = _thresholds_for(feature)
+    p95_threshold = t.p95_ms
+    error_rate_threshold = t.error_rate
+    profile = get_profile("pull_request", _get_policy())
+    vus = profile.k6_vus if profile else 10
+    duration = profile.k6_duration if profile else "30s"
 
     if method in ("post", "put", "patch"):
         real_call = f"http.{method}(`${{BASE_URL}}{path_with_id}`, payload, params);"
@@ -154,8 +207,9 @@ def _k6_template(feature: FeatureChange, env: str) -> str:
         payload_block = ""
 
     return f"""// k6 performance test — {feature.method} {feature.path}
-// Repo: auto-generated | Env: {env}
+// Repo: auto-generated | Env: {env} | Domain: {domain}
 // {feature.description}
+// Thresholds sourced from .perf/thresholds.yaml
 
 import http from 'k6/http';
 import {{ check, sleep }} from 'k6';
@@ -164,12 +218,13 @@ const BASE_URL = __ENV.SFCC_SITE_URL || 'https://test.k6.io';
 const IS_REAL_APP = !BASE_URL.includes('test.k6.io');
 
 export const options = {{
-  vus: 10,
-  duration: '30s',
+  vus: {vus},
+  duration: '{duration}',
   thresholds: {{
-    http_req_duration: ['p(95)<2000'],
-    http_req_failed:   ['rate<0.10'],
+    http_req_duration: ['p(95)<{p95_threshold}'],
+    http_req_failed:   ['rate<{error_rate_threshold}'],
   }},
+  tags: {{ domain: '{domain}', env: '{env}' }},
 }};
 
 export default function () {{
@@ -177,7 +232,7 @@ export default function () {{
 {payload_block}    const res = {real_call}
     check(res, {{
       'status 2xx or 404': (r) => r.status >= 200 && r.status < 500,
-      'response time ok':  (r) => r.timings.duration < 2000,
+      'response time ok':  (r) => r.timings.duration < {p95_threshold},
     }});
   }} else {{
     const res = http.get(BASE_URL);
@@ -192,17 +247,35 @@ def _generate_k6(feature: FeatureChange, env: str) -> str:
     if not _openai_available():
         return _k6_template(feature, env)
     try:
+        t = _thresholds_for(feature)
+        domain = _domain_from_feature(feature)
+        profile = get_profile("pull_request", _get_policy())
+        vus = profile.k6_vus if profile else 10
+        duration = profile.k6_duration if profile else "30s"
+        gen_rules = get_generation_rules(_get_policy())
+        skill = _get_scripting_skill()
+        # Use skill file sections if available, else fall back to inline rules
+        rules_section = ""
+        if skill:
+            # Extract just the generation standards section to keep prompt focused
+            if "## Step 4" in skill:
+                section = skill.split("## Step 4")[1].split("##")[0].strip()
+                rules_section = f"\n## Script generation standards:\n{section[:600]}\n"
+        elif gen_rules:
+            rules_section = f"\n## Repo generation standards:\n{gen_rules[:600]}\n"
+
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Write a complete k6 JS performance test.
-Method: {feature.method} | Path: {feature.path} | Env: {env}
+Method: {feature.method} | Path: {feature.path} | Env: {env} | Domain: {domain}
 {_app_context(feature)}
 - Fallback: __ENV.SFCC_SITE_URL || 'https://test.k6.io'
 - const IS_REAL_APP = !BASE_URL.includes('test.k6.io')
 - Wrap real calls in if (IS_REAL_APP) else http.get(BASE_URL)
-- options: 10 VUs, 30s, p(95)<2000, rate<0.05
+- options: {vus} VUs, {duration}, p(95)<{t.p95_ms}, rate<{t.error_rate}
+- tags: {{ domain: '{domain}', env: '{env}' }}
 - check() for 200/201, sleep(1)
-- Return ONLY JS, no markdown fences."""}],
+{rules_section}- Return ONLY JS, no markdown fences."""}],
             temperature=0.2,
         )
         script = _strip_fences(resp.choices[0].message.content.strip())
@@ -216,11 +289,24 @@ def _update_k6(existing: str, feature: FeatureChange, env: str) -> str:
     if not _openai_available():
         return _k6_template(feature, env)
     try:
+        t = _thresholds_for(feature)
+        domain = _domain_from_feature(feature)
+        gen_rules = get_generation_rules(_get_policy())
+        skill = _get_scripting_skill()
+        rules_section = ""
+        if skill and "## Step 4" in skill:
+            section = skill.split("## Step 4")[1].split("##")[0].strip()
+            rules_section = f"\n## Script generation standards:\n{section[:500]}\n"
+        elif gen_rules:
+            rules_section = f"\n## Repo generation standards:\n{gen_rules[:500]}\n"
+
         resp = client.chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Update this k6 script for the modified endpoint.
-{feature.method} {feature.path} — {feature.description}
-Keep IS_REAL_APP fallback. Return ONLY JS, no fences.
+{feature.method} {feature.path} — {feature.description} | Domain: {domain}
+Keep IS_REAL_APP fallback. Use p(95)<{t.p95_ms}, rate<{t.error_rate}.
+Add tags: {{ domain: '{domain}' }} if not present.
+{rules_section}Return ONLY JS, no fences.
 ---
 {existing}"""}],
             temperature=0,
@@ -234,13 +320,17 @@ Keep IS_REAL_APP fallback. Return ONLY JS, no fences.
 def _inject_options_if_missing(script: str, feature: FeatureChange) -> str:
     if "export const options" in script:
         return script
+    t = _thresholds_for(feature)
+    profile = get_profile("pull_request", _get_policy())
+    vus = profile.k6_vus if profile else 10
+    duration = profile.k6_duration if profile else "30s"
     block = (
-        "\nexport const options = {\n"
-        "  vus: 10,\n  duration: '30s',\n"
-        "  thresholds: {\n"
-        "    http_req_duration: ['p(95)<2000'],\n"
-        "    http_req_failed:   ['rate<0.05'],\n"
-        "  },\n};\n"
+        f"\nexport const options = {{\n"
+        f"  vus: {vus},\n  duration: '{duration}',\n"
+        f"  thresholds: {{\n"
+        f"    http_req_duration: ['p(95)<{t.p95_ms}'],\n"
+        f"    http_req_failed:   ['rate<{t.error_rate}'],\n"
+        f"  }},\n}};\n"
     )
     lines = script.splitlines()
     idx = max(

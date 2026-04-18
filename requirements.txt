@@ -7,3 +7,4 @@ langchain-openai
 langsmith
 psutil
 selenium
+pyyaml

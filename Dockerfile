@@ -16,10 +16,13 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY . .
 
 # Runtime dirs — created here so volumes mount cleanly
-RUN mkdir -p logs scripts reports
+RUN mkdir -p logs scripts reports checkpoints
+
+# Ensure .perf policy layer is present (mounted volume will override at runtime)
+RUN mkdir -p .perf/rules .perf/profiles .perf/baselines
 
 # Default port — overridden per-service in docker-compose / k8s
-EXPOSE 5000 5001
+EXPOSE 5000 5001 5002
 
 # Default entrypoint — overridden by docker-compose command:
 CMD ["python", "rca_agent.py"]
