@@ -1,8 +1,340 @@
 # AI Performance Agent
 
-Watches your GitHub repo via webhooks, detects code changes, and automatically
-generates or patches k6, LoadRunner, and Selenium scripts — keeping CI green
-without manual edits.
+Watches your GitHub repo via webhooks, detects code changes, and automatically generates or updates k6, Selenium, and LoadRunner scripts — driven entirely by policy files and agent skill files, no hardcoded logic.
+
+---
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                        Docker / Kubernetes                          │
+│                                                                     │
+│  ┌──────────────────────┐        ┌──────────────────────────────┐  │
+│  │  Test Trigger Agent  │        │         RCA Agent            │  │
+│  │     port 5001        │        │         port 5000            │  │
+│  │                      │        │                              │  │
+│  │  code_change_detector│        │  AI root cause analysis      │  │
+│  │  script_generator    │        │  Jira / Slack / Email        │  │
+│  │  script_patcher      │        │  merge gate decision         │  │
+│  │  script_health_check │        │  system diagnostics          │  │
+│  │  selenium_index      │        │                              │  │
+│  │  commit_tracker      │        │                              │  │
+│  └──────────┬───────────┘        └──────────────┬───────────────┘  │
+│             │                                   │                  │
+│             │   call_tool(...)                  │  call_tool(...)  │
+│             └──────────────────┬────────────────┘                  │
+│                                ▼                                   │
+│              ┌─────────────────────────────────┐                   │
+│              │         MCP Server              │                   │
+│              │         port 5002               │                   │
+│              │                                 │                   │
+│              │  GET  /tools                    │                   │
+│              │  POST /tools/k6                 │                   │
+│              │  POST /tools/run_tests          │                   │
+│              │  POST /tools/generate_scripts   │                   │
+│              │  POST /tools/get_impact_map     │                   │
+│              │  POST /tools/compare_with_baseline                  │
+│              │  POST /tools/get_selenium_index │                   │
+│              │  POST /tools/find_affected_selenium                 │
+│              │  POST /tools/jira               │                   │
+│              │  POST /tools/slack              │                   │
+│              │  POST /tools/grafana            │                   │
+│              │  POST /tools/datadog            │                   │
+│              │  POST /tools/github_commits     │                   │
+│              └────────────────┬────────────────┘                   │
+│                               │                                    │
+│         ┌─────────────────────┼──────────────────────┐            │
+│         ▼                     ▼                      ▼            │
+│  ┌─────────────┐   ┌─────────────────┐   ┌──────────────────┐    │
+│  │  Target App │   │  Prometheus     │   │    Grafana       │    │
+│  │  (your app) │   │  port 9090      │   │    port 3000     │    │
+│  └─────────────┘   └─────────────────┘   └──────────────────┘    │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
+---
+
+## Policy + Skill Layer
+
+All agent behaviour is driven by files — no hardcoded logic.
+
+### Agent Skill Files
+
+| File | Loaded by | Purpose |
+|------|-----------|---------|
+| `PERF_AGENTS.md` | RCA Agent | Platform rules, PR comment format, risk classification |
+| `SCRIPTING_AGENT.md` | Script Generator, Orchestrator | Step-by-step scripting behaviour, routing rules |
+| `PERF_EXEC_AGENT.md` | RCA Agent | Execution profile selection, regression classification, merge gate |
+
+### Policy Files (`.perf/` directory)
+
+| File | Purpose |
+|------|---------|
+| `.perf/mappings.yaml` | Maps code paths → affected test domains |
+| `.perf/thresholds.yaml` | Domain-specific SLO thresholds (p95, error rate) |
+| `.perf/profiles/pr-smoke.yaml` | PR profile: VUs, duration, merge gate rules |
+| `.perf/profiles/main-regression.yaml` | Merge-to-main profile |
+| `.perf/profiles/nightly-endurance.yaml` | Nightly soak test profile |
+| `.perf/rules/commit-routing.md` | When to generate/skip scripts |
+| `.perf/rules/script-generation.md` | Naming, threshold, tagging standards |
+| `.perf/rules/execution-policy.md` | What runs on PR vs merge vs nightly |
+| `.perf/rules/regression-thresholds.md` | Regression classification rules |
+
+Edit any of these files — changes take effect on the next webhook with no rebuild.
+
+---
+
+## How It Works — Full Flow
+
+```
+Developer pushes code to GitHub
+          │
+          ▼
+GitHub sends webhook event
+          │
+          ├──────────────────────────────────────────────────────────┐
+          ▼                                                          ▼
+POST :5001/github-webhook                            POST :5000/github-webhook
+Test Trigger Agent                                   RCA Agent
+(test_trigger_agent.py)                              (rca_agent.py)
+          │                                                          │
+          │  queued via WebhookQueue (FIFO)                          │  runs immediately
+          ▼                                                          ▼
+test_orchestrator.py                                 run k6 via MCP → /tools/k6
+          │                                          AI RCA using PERF_EXEC_AGENT.md
+  ┌───────┴────────────────────────────────┐         merge gate from .perf/profiles/
+  │                                        │         Jira / Slack / Email / report
+  │  STEP 1 — PRE Health Check             │
+  │  Run all existing k6 scripts           │
+  │                                        │
+  │  STEP 2 — Fix Pre-existing Failures    │
+  │  GPT fixes failing scripts (max 5x)    │
+  │                                        │
+  │  STEP 3 — Build Impact Map             │
+  │  .perf/mappings.yaml                   │
+  │  → which domains are affected?         │
+  │  → skip docs/config-only changes       │
+  │                                        │
+  │  STEP 4 — Detect Changes               │
+  │  code_change_detector.py               │
+  │  → Scenario A: dep upgrade             │
+  │  → Scenario B: new/changed endpoint    │
+  │                                        │
+  │  STEP 5 — Route by Domain              │
+  │  Only generate for affected domains    │
+  │  (not all features in the diff)        │
+  │                                        │
+  │  STEP 6 — Generate / Update Scripts    │
+  │  k6: policy thresholds + profile VUs   │
+  │  Selenium: index lookup → surgical     │
+  │    update (50 lines not 1000)          │
+  │  LoadRunner: combined journey          │
+  │                                        │
+  │  STEP 7 — POST Health Check            │
+  │  Re-run all k6 scripts                 │
+  │                                        │
+  │  STEP 8 — Merge Gate                   │
+  │  .perf/profiles/pr-smoke.yaml          │
+  │  → pass / warn / fail                  │
+  │  → block merge if high-risk failure    │
+  │                                        │
+  │  STEP 9 — Save Checkpoint              │
+  │                                        │
+  └───────────────────────────────────────┘
+          │
+          ▼
+  Post PR comment + merge gate status
+  Send Slack notification
+```
+
+---
+
+## Selenium Index (for large script sets)
+
+For repos with hundreds or thousands of Selenium scripts, the agent maintains a lightweight JSON index at:
+
+```
+scripts/<repo>/dev/selenium/.selenium_index.json
+```
+
+This means on every webhook the agent does an O(1) lookup to find affected scripts instead of scanning all files. Updates are surgical — only the relevant 30-50 lines of a 1000-line file are sent to GPT, not the whole file.
+
+```
+Code change detected
+      │
+      ▼
+find_affected_selenium(changed_files, index)
+→ reads one JSON file
+→ returns only matching scripts
+      │
+      ▼
+extract_changed_methods(full_file, feature)
+→ extracts ~50 relevant lines
+→ GPT updates only that section
+→ spliced back into full file
+```
+
+Query the index via MCP:
+```bash
+curl -X POST http://localhost:5002/tools/find_affected_selenium \
+  -H "Content-Type: application/json" \
+  -d '{"changed_files": ["services/checkout/payment.py"]}'
+```
+
+---
+
+## First Boot — Full History Scan
+
+```
+Container starts — no scripts, no checkpoint
+      │
+      ▼
+scan_full_repo()
+  → fetch all commits (paginated, oldest first)
+  → detect_changes() on every commit diff
+  → accumulate unique endpoints
+  → generate k6 + Selenium + LoadRunner for each
+  → build selenium index
+  → save checkpoint at HEAD
+      │
+      ▼
+Normal webhook-driven mode
+(full scan never runs again unless checkpoint is reset)
+```
+
+Reset: `POST http://localhost:5001/checkpoint/reset`
+
+---
+
+## Script Folder Structure
+
+```
+scripts/
+  <repo_slug>/
+    dev/
+      k6/
+        api_checkout_perf_test.js
+        api_login_perf_test.js
+      loadrunner/
+        full_journey_lr_test.c        ← single combined journey
+      selenium/
+        .selenium_index.json          ← index of all scripts
+        src/test/java/com/ecommerce/
+          tests/
+            CheckoutTest.java
+            LoginTest.java
+          pages/
+            CheckoutPage.java
+            LoginPage.java
+        src/test/resources/testng.xml
+        pom.xml
+    stage/
+    prod/
+```
+
+---
+
+## Setup
+
+### 1. Clone and configure
+
+```bash
+git clone <your-repo>
+cp .env.example .env
+# Fill in OPENAI_API_KEY, GITHUB_TOKEN, GITHUB_REPOS, SFCC_SITE_URL
+```
+
+### 2. Run
+
+```bash
+docker-compose up --build
+```
+
+| Service | URL | Purpose |
+|---------|-----|---------|
+| Test Trigger Agent | http://localhost:5001 | Webhooks, script generation |
+| RCA Agent | http://localhost:5010 | k6 runs, AI RCA, reports |
+| MCP Server | http://localhost:5002 | Tool gateway |
+| Prometheus | http://localhost:9090 | Metrics |
+| Grafana | http://localhost:3000 | Dashboards (admin/admin) |
+| Filebrowser | http://localhost:8888 | Browse scripts/logs/reports |
+
+### 3. Configure GitHub webhooks
+
+| Webhook URL | Events |
+|-------------|--------|
+| `http://<host>:5001/github-webhook` | Push + Pull requests |
+| `http://<host>:5010/github-webhook` | Push + Pull requests |
+
+---
+
+## MCP Tool Reference
+
+```bash
+curl http://localhost:5002/tools   # list all tools
+```
+
+| Tool | Description |
+|------|-------------|
+| `k6` | Run k6 performance tests |
+| `run_tests` | Run all k6 + Selenium with AI self-heal |
+| `generate_scripts` | Generate scripts for changed files |
+| `get_impact_map` | Get affected domains for changed files |
+| `compare_with_baseline` | Classify regression vs baseline |
+| `get_selenium_index` | View all Selenium scripts + metadata |
+| `find_affected_selenium` | Find scripts affected by changed files |
+| `jira` | Create Jira ticket |
+| `slack` | Send Slack message |
+| `grafana` | Fetch Grafana dashboards |
+| `datadog` | Query Datadog metrics |
+| `github_commits` | Fetch latest commits |
+
+---
+
+## Key Files
+
+| File | Purpose |
+|------|---------|
+| `test_trigger_agent.py` | Test Trigger Agent — port 5001 |
+| `rca_agent.py` | RCA Agent — port 5000 |
+| `mcp_server.py` | MCP Tool Server — port 5002 |
+| `agent/mcp_client.py` | HTTP client for MCP server |
+| `agent/test_orchestrator.py` | Full pipeline: routing, generation, merge gate |
+| `agent/code_change_detector.py` | Parses diffs → Scenario A / B |
+| `agent/script_generator.py` | CREATE / UPDATE k6, LoadRunner, Selenium |
+| `agent/selenium_index.py` | Index for fast lookup across 2000+ scripts |
+| `agent/perf_policy.py` | Loads all policy + skill files |
+| `agent/script_patcher.py` | GPT patch for dep/feature changes |
+| `agent/script_health_checker.py` | PRE / POST script health checks |
+| `agent/commit_tracker.py` | Checkpoint JSON tracking |
+| `agent/concurrency.py` | File locks + webhook queue |
+| `agent/regression_engine.py` | Policy-driven regression detection |
+| `regression_detector.py` | Baseline comparison + classification |
+| `PERF_AGENTS.md` | Platform-level agent skill |
+| `SCRIPTING_AGENT.md` | Scripting agent skill |
+| `PERF_EXEC_AGENT.md` | Execution agent skill |
+| `.perf/` | All policy files (mappings, thresholds, profiles, rules) |
+
+---
+
+## Deploy to AWS (EKS)
+
+```bash
+# Build and push to ECR
+aws ecr get-login-password | docker login --username AWS \
+  --password-stdin <account>.dkr.ecr.<region>.amazonaws.com
+docker build -t ai-agent .
+docker tag ai-agent:latest <account>.dkr.ecr.<region>.amazonaws.com/ai-agent:latest
+docker push <account>.dkr.ecr.<region>.amazonaws.com/ai-agent:latest
+
+# Deploy
+kubectl apply -f k8s-secret.yaml
+kubectl apply -f deployment.yaml
+kubectl apply -f service.yaml
+kubectl get services   # get LoadBalancer URLs for webhooks
+```
+
 
 ---
 

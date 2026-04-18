@@ -159,7 +159,165 @@
       "summary": "Startup gap-fill: 0 existed, 16 generated, 0 total on disk registered.",
       "sha": "d354a7949934484021c847abebb296d0cc52ca19",
       "processed_at": "2026-04-18T15:53:11.140158+00:00"
+    },
+    {
+      "scripts_created": [
+        "",
+        "scripts/cold-starr_testrepo/dev/selenium/src/test/java/com/ecommerce/tests/ProductsTest.java",
+        "scripts/cold-starr_testrepo/dev/selenium/src/test/java/com/ecommerce/tests/UsersTest.java",
+        "scripts/cold-starr_testrepo/dev/selenium/src/test/java/com/ecommerce/tests/OrdersTest.java"
+      ],
+      "scripts_updated": [],
+      "dependency_changes": [],
+      "feature_changes": [
+        {
+          "method": "POST",
+          "path": "/api/orders"
+        },
+        {
+          "method": "GET",
+          "path": "/orders"
+        },
+        {
+          "method": "GET",
+          "path": "/orders{order_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/orders{order_id}"
+        },
+        {
+          "method": "POST",
+          "path": "/api/products"
+        },
+        {
+          "method": "GET",
+          "path": "/products"
+        },
+        {
+          "method": "GET",
+          "path": "/products{product_id}"
+        },
+        {
+          "method": "PUT",
+          "path": "/products{product_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/products{product_id}"
+        },
+        {
+          "method": "POST",
+          "path": "/api/users"
+        },
+        {
+          "method": "GET",
+          "path": "/users"
+        },
+        {
+          "method": "GET",
+          "path": "/users{user_id}"
+        },
+        {
+          "method": "PUT",
+          "path": "/users{user_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/users{user_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/users/{id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/products/{id}"
+        }
+      ],
+      "summary": "Startup gap-fill: 0 existed, 16 generated, 0 total on disk registered.",
+      "sha": "d354a7949934484021c847abebb296d0cc52ca19",
+      "processed_at": "2026-04-18T16:58:06.097818+00:00"
+    },
+    {
+      "scripts_created": [
+        "",
+        "scripts/cold-starr_testrepo/dev/selenium/src/test/java/com/ecommerce/tests/ProductsTest.java",
+        "scripts/cold-starr_testrepo/dev/selenium/src/test/java/com/ecommerce/tests/OrdersTest.java",
+        "scripts/cold-starr_testrepo/dev/selenium/src/test/java/com/ecommerce/tests/UsersTest.java"
+      ],
+      "scripts_updated": [],
+      "dependency_changes": [],
+      "feature_changes": [
+        {
+          "method": "POST",
+          "path": "/api/orders"
+        },
+        {
+          "method": "GET",
+          "path": "/orders"
+        },
+        {
+          "method": "GET",
+          "path": "/orders{order_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/orders{order_id}"
+        },
+        {
+          "method": "POST",
+          "path": "/api/products"
+        },
+        {
+          "method": "GET",
+          "path": "/products"
+        },
+        {
+          "method": "GET",
+          "path": "/products{product_id}"
+        },
+        {
+          "method": "PUT",
+          "path": "/products{product_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/products{product_id}"
+        },
+        {
+          "method": "POST",
+          "path": "/api/users"
+        },
+        {
+          "method": "GET",
+          "path": "/users"
+        },
+        {
+          "method": "GET",
+          "path": "/users{user_id}"
+        },
+        {
+          "method": "PUT",
+          "path": "/users{user_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/users{user_id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/users/{id}"
+        },
+        {
+          "method": "DELETE",
+          "path": "/api/products/{id}"
+        }
+      ],
+      "summary": "Startup gap-fill: 0 existed, 16 generated, 0 total on disk registered.",
+      "sha": "d354a7949934484021c847abebb296d0cc52ca19",
+      "processed_at": "2026-04-18T17:11:04.657403+00:00"
     }
   ],
-  "last_processed_at": "2026-04-18T15:53:11.140158+00:00"
+  "last_processed_at": "2026-04-18T17:11:04.657403+00:00"
 }

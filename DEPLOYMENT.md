@@ -277,6 +277,16 @@ curl -X POST http://localhost:5001/checkpoint/reset
 curl -X POST http://localhost:5001/self-heal
 ```
 
+### 7. Check selenium index (for large script sets)
+
+```bash
+curl -X POST http://localhost:5002/tools/get_selenium_index \
+  -H "Content-Type: application/json" \
+  -d '{"repo": "org/myrepo", "env": "dev"}'
+```
+
+Expected output includes `total_scripts`, `total_lines`, and per-script metadata.
+
 ---
 
 ## Kubernetes Deployment (EKS)
@@ -410,6 +420,8 @@ Edit the skill files directly — changes take effect on next agent invocation (
 | POST | `/tools/generate_scripts` | Generate scripts for changed files |
 | POST | `/tools/get_impact_map` | Get affected domains for changed files |
 | POST | `/tools/compare_with_baseline` | Classify regression vs baseline |
+| POST | `/tools/get_selenium_index` | View all Selenium scripts + metadata |
+| POST | `/tools/find_affected_selenium` | Find scripts affected by changed files |
 | POST | `/tools/jira` | Create Jira ticket |
 | POST | `/tools/slack` | Send Slack message |
 | POST | `/tools/grafana` | Fetch Grafana dashboards |
@@ -464,13 +476,38 @@ Edit the skill files directly — changes take effect on next agent invocation (
 2. Check MCP server health: `curl http://localhost:5002/`
 3. Agents fall back to local tool implementations automatically if MCP is down
 
+### Selenium scripts not updating correctly
+
+1. Check if the selenium index exists:
+   ```bash
+   docker exec test-trigger-agent ls scripts/<repo_slug>/dev/selenium/.selenium_index.json
+   ```
+2. Rebuild the index from disk if missing:
+   ```bash
+   curl -X POST http://localhost:5002/tools/get_selenium_index \
+     -H "Content-Type: application/json" \
+     -d '{"repo": "org/myrepo", "env": "dev"}'
+   ```
+3. Find which scripts are affected by a change:
+   ```bash
+   curl -X POST http://localhost:5002/tools/find_affected_selenium \
+     -H "Content-Type: application/json" \
+     -d '{"changed_files": ["services/checkout/payment.py"]}'
+   ```
+
+### Merge gate always passing / always failing
+
+1. Check the profile in `.perf/profiles/pr-smoke.yaml` — verify `warn_on_regression_pct` and `block_on_regression_pct` are set
+2. Check the risk level in `.perf/mappings.yaml` for the affected domain
+3. View merge gate result in the webhook response: `result.merge_gate.status`
+
 ---
 
 ## Volumes and Persistence
 
 | Volume | Path in container | Purpose |
 |--------|------------------|---------|
-| `./scripts` | `/app/scripts` | Generated test scripts |
+| `./scripts` | `/app/scripts` | Generated test scripts + selenium index |
 | `./logs` | `/app/logs` | Agent + MCP logs |
 | `./reports` | `/app/reports` | RCA report JSON + markdown |
 | `./checkpoints` | `/app/checkpoints` | Commit checkpoint state |
@@ -479,7 +516,7 @@ Edit the skill files directly — changes take effect on next agent invocation (
 | `./PERF_EXEC_AGENT.md` | `/app/PERF_EXEC_AGENT.md` | Agent skill (read-only) |
 | `./PERF_AGENTS.md` | `/app/PERF_AGENTS.md` | Agent skill (read-only) |
 
-Policy and skill files are mounted read-only. Edit them on the host and the running containers pick up changes immediately — no rebuild required.
+The selenium index (`scripts/<repo>/dev/selenium/.selenium_index.json`) lives inside the `./scripts` volume and persists across container restarts. It is rebuilt automatically on first boot or when missing.
 
 ---
 

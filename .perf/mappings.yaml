@@ -104,3 +104,16 @@ mappings:
       k6:
         - "contracts"
     risk: medium
+
+  - name: transactions-domain
+    paths:
+      - "**/transaction*"
+      - "**/add*"
+      - "**/delete*"
+      - "api/transactions/**"
+    affects:
+      k6:
+        - "transactions"
+      selenium:
+        - "transactions"
+    risk: medium

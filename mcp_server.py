@@ -72,6 +72,18 @@ TOOL_REGISTRY = {
         "description": "Return which test domains and scripts are affected by a set of changed files, using .perf/mappings.yaml",
         "input": {"changed_files": "list of changed file paths (required)"},
     },
+    "get_selenium_index": {
+        "description": "Return the Selenium script index for a repo/env — shows all 2000 scripts, their domains, endpoints, line counts",
+        "input": {"repo": "string (optional)", "env": "string (optional, default: dev)"},
+    },
+    "find_affected_selenium": {
+        "description": "Find which Selenium scripts are affected by a list of changed files using the index",
+        "input": {
+            "changed_files": "list of changed file paths (required)",
+            "repo":          "string (optional)",
+            "env":           "string (optional, default: dev)",
+        },
+    },
     "compare_with_baseline": {
         "description": "Compare current run metrics against stored baseline and classify regression",
         "input": {
@@ -328,12 +340,58 @@ def _handle_compare_with_baseline(params: dict) -> dict:
         return {"error": str(e)}
 
 
+def _handle_get_selenium_index(params: dict) -> dict:
+    """Return the full Selenium script index for a repo/env."""
+    try:
+        from agent.selenium_index import get_or_build_index
+        from agent.script_generator import _script_root
+        repo = params.get("repo", os.getenv("GITHUB_REPOS", "").split(",")[0].strip())
+        env  = params.get("env", os.getenv("ENV", "dev"))
+        sel_root = os.path.join(_script_root(repo, env), "selenium")
+        index = get_or_build_index(sel_root)
+        return {
+            "status":       "ok",
+            "total_scripts": len(index),
+            "total_lines":  sum(e.get("line_count", 0) for e in index.values()),
+            "scripts":      index,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
+def _handle_find_affected_selenium(params: dict) -> dict:
+    """Find Selenium scripts affected by changed files using the index."""
+    try:
+        from agent.selenium_index import get_or_build_index, find_scripts_for_changed_files
+        from agent.script_generator import _script_root
+        from agent.perf_policy import load_policy
+        changed_files = params.get("changed_files", [])
+        repo = params.get("repo", os.getenv("GITHUB_REPOS", "").split(",")[0].strip())
+        env  = params.get("env", os.getenv("ENV", "dev"))
+        if not changed_files:
+            return {"status": "skipped", "reason": "No changed_files provided"}
+        sel_root = os.path.join(_script_root(repo, env), "selenium")
+        index    = get_or_build_index(sel_root)
+        policy   = load_policy()
+        affected = find_scripts_for_changed_files(changed_files, index, policy)
+        return {
+            "status":           "ok",
+            "affected_count":   len(affected),
+            "total_in_index":   len(index),
+            "affected_scripts": affected,
+        }
+    except Exception as e:
+        return {"error": str(e)}
+
+
 _HANDLERS = {
     "k6":                    _handle_k6,
     "run_tests":             _handle_run_tests,
     "generate_scripts":      _handle_generate_scripts,
     "get_impact_map":        _handle_get_impact_map,
     "compare_with_baseline": _handle_compare_with_baseline,
+    "get_selenium_index":    _handle_get_selenium_index,
+    "find_affected_selenium": _handle_find_affected_selenium,
     "grafana":               _handle_grafana,
     "jira":                  _handle_jira,
     "datadog":               _handle_datadog,

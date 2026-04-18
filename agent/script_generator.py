@@ -39,6 +39,10 @@ from agent.perf_policy import (
     PerfPolicy, ThresholdConfig,
     load_policy, get_thresholds, get_generation_rules, get_profile, load_agent_skill,
 )
+from agent.selenium_index import (
+    register_script, get_or_build_index,
+    find_scripts_for_changed_files, extract_changed_methods,
+)
 
 load_dotenv()
 
@@ -74,11 +78,36 @@ def set_policy(policy: PerfPolicy) -> None:
 
 
 def _domain_from_feature(feature: FeatureChange) -> str:
-    """Infer domain name from endpoint path for threshold lookup."""
+    """
+    Infer domain name from endpoint path.
+    Checks .perf/mappings.yaml first (policy-driven), then falls back
+    to keyword matching so it works even without a mappings file.
+    """
+    policy = _get_policy()
+
+    # Policy-driven: check mappings.yaml for the source file
+    if policy.loaded and feature.file:
+        from agent.perf_policy import get_domain_for_file
+        domain = get_domain_for_file(feature.file, policy)
+        if domain:
+            return domain.replace("-domain", "")
+
+    # Policy-driven: check mappings by endpoint path keywords
+    if policy.loaded:
+        path_lower = feature.path.lower()
+        for mapping in policy.mappings:
+            keyword = mapping.name.replace("-domain", "").lower()
+            if keyword in path_lower:
+                return keyword
+
+    # Fallback: built-in keyword list
     path = feature.path.lower()
-    for keyword in ("checkout", "auth", "login", "cart", "search", "order", "product", "user"):
+    for keyword in ("checkout", "auth", "login", "cart", "search",
+                    "order", "product", "user", "payment", "transaction",
+                    "account", "add", "delete", "update"):
         if keyword in path:
             return keyword
+
     return "default"
 
 
@@ -763,11 +792,14 @@ def _generate_selenium_java(feature: FeatureChange, sel_root: str,
                              base_url: str, all_features: list = None) -> str:
     """
     Generate/update a Java Maven Selenium project.
+    - On CREATE: GPT generates full Page Object + Test class
+    - On UPDATE: surgical diff — only send affected methods to GPT, not full file
+    - Registers every write in the selenium index for fast lookup
     Returns the path to the test file written.
     """
     class_name = _java_class_name(feature.path)
+    domain     = _domain_from_feature(feature)
 
-    # Paths
     test_dir  = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
     page_dir  = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "pages")
     res_dir   = os.path.join(sel_root, "src", "test", "resources")
@@ -776,43 +808,49 @@ def _generate_selenium_java(feature: FeatureChange, sel_root: str,
     for d in [test_dir, page_dir, res_dir, main_dir]:
         os.makedirs(d, exist_ok=True)
 
-    # pom.xml — write once
-    pom_path = os.path.join(sel_root, "pom.xml")
-    if not os.path.exists(pom_path):
-        _write(pom_path, _selenium_pom())
+    if not os.path.exists(os.path.join(sel_root, "pom.xml")):
+        _write(os.path.join(sel_root, "pom.xml"), _selenium_pom())
+    if not os.path.exists(os.path.join(test_dir, "BaseTest.java")):
+        _write(os.path.join(test_dir, "BaseTest.java"), _selenium_base_test(base_url))
 
-    # BaseTest.java — write once
-    base_path = os.path.join(test_dir, "BaseTest.java")
-    if not os.path.exists(base_path):
-        _write(base_path, _selenium_base_test(base_url))
-
-    # Page object
     page_path = os.path.join(page_dir, f"{class_name}Page.java")
-    if not os.path.exists(page_path):
-        if _openai_available():
-            content = _generate_selenium_java_ai(feature, "page", class_name)
-        else:
-            content = _selenium_page_template(class_name, feature)
-        _write(page_path, content)
-    else:
-        if _openai_available():
-            existing = open(page_path, encoding="utf-8").read()
-            content  = _update_selenium_java_ai(existing, feature, "page", class_name)
-            _write(page_path, content)
-
-    # Test class
     test_path = os.path.join(test_dir, f"{class_name}Test.java")
+
     if not os.path.exists(test_path):
+        # ── CREATE: full generation ───────────────────────────────────────────
         if _openai_available():
-            content = _generate_selenium_java_ai(feature, "test", class_name)
+            _write(page_path, _generate_selenium_java_ai(feature, "page", class_name))
+            _write(test_path, _generate_selenium_java_ai(feature, "test", class_name))
         else:
-            content = _selenium_test_template(class_name, feature)
-        _write(test_path, content)
+            if not os.path.exists(page_path):
+                _write(page_path, _selenium_page_template(class_name, feature))
+            _write(test_path, _selenium_test_template(class_name, feature))
     else:
+        # ── UPDATE: surgical — only send affected section to GPT ──────────────
         if _openai_available():
-            existing = open(test_path, encoding="utf-8").read()
-            content  = _update_selenium_java_ai(existing, feature, "test", class_name)
-            _write(test_path, content)
+            # Page object — surgical update
+            if os.path.exists(page_path):
+                existing_page = open(page_path, encoding="utf-8").read()
+                snippet = extract_changed_methods(existing_page, feature)
+                # Only rewrite if the snippet is meaningfully smaller than full file
+                if len(snippet.splitlines()) < len(existing_page.splitlines()) * 0.6:
+                    updated_page = _update_selenium_surgical(
+                        existing_page, snippet, feature, "page", class_name
+                    )
+                else:
+                    updated_page = _update_selenium_java_ai(existing_page, feature, "page", class_name)
+                _write(page_path, updated_page)
+
+            # Test class — surgical update
+            existing_test = open(test_path, encoding="utf-8").read()
+            snippet = extract_changed_methods(existing_test, feature)
+            if len(snippet.splitlines()) < len(existing_test.splitlines()) * 0.6:
+                updated_test = _update_selenium_surgical(
+                    existing_test, snippet, feature, "test", class_name
+                )
+            else:
+                updated_test = _update_selenium_java_ai(existing_test, feature, "test", class_name)
+            _write(test_path, updated_test)
 
     # testng.xml — regenerate to include all test classes
     existing_tests = [
@@ -821,6 +859,12 @@ def _generate_selenium_java(feature: FeatureChange, sel_root: str,
         if f.endswith("Test.java") and f != "BaseTest.java"
     ]
     _write(os.path.join(res_dir, "testng.xml"), _selenium_testng_xml(existing_tests))
+
+    # ── Register in selenium index ────────────────────────────────────────────
+    register_script(
+        sel_root, class_name, test_path, page_path,
+        feature, domains=[f"{domain}-domain"],
+    )
 
     return test_path
 
@@ -873,7 +917,7 @@ Requirements:
 
 def _update_selenium_java_ai(existing: str, feature: FeatureChange,
                               file_type: str, class_name: str) -> str:
-    """Update existing Java Selenium file via GPT."""
+    """Update existing Java Selenium file via GPT — full file rewrite."""
     if not _openai_available():
         return existing
     try:
@@ -892,6 +936,59 @@ Keep class structure. Return ONLY Java code, no fences.
         return existing
 
 
+def _update_selenium_surgical(
+    full_file: str,
+    snippet: str,
+    feature: FeatureChange,
+    file_type: str,
+    class_name: str,
+) -> str:
+    """
+    Surgical update — send only the affected section to GPT, then splice
+    the updated section back into the full file.
+
+    This keeps token usage proportional to the change size, not the file size.
+    A 1000-line file with a 30-line change sends ~50 lines to GPT, not 1000.
+    """
+    if not _openai_available():
+        return full_file
+    try:
+        resp = client.chat.completions.create(
+            model=OPENAI_MODEL,
+            messages=[{"role": "user", "content": (
+                f"Update ONLY the relevant section of this Java Selenium {file_type} "
+                f"for the modified endpoint.\n"
+                f"{feature.method} {feature.path} — {feature.description}\n"
+                f"Return ONLY the updated Java snippet (same methods, updated logic). "
+                f"No class declaration, no fences.\n"
+                f"---\n{snippet}"
+            )}],
+            temperature=0,
+        )
+        updated_snippet = _strip_fences(resp.choices[0].message.content.strip())
+
+        # Splice: replace the snippet lines back into the full file
+        # Find the first line of the snippet in the full file and replace that block
+        snippet_first = snippet.splitlines()[0].strip()
+        full_lines    = full_file.splitlines()
+        snippet_lines = updated_snippet.splitlines()
+
+        for i, line in enumerate(full_lines):
+            if line.strip() == snippet_first:
+                # Replace from this line for len(snippet) lines
+                original_len = len(snippet.splitlines())
+                full_lines[i:i + original_len] = snippet_lines
+                return "\n".join(full_lines)
+
+        # Splice failed — fall back to full rewrite
+        print(f"[script_generator] Surgical splice failed for {class_name} — falling back to full rewrite")
+        return _update_selenium_java_ai(full_file, feature, file_type, class_name)
+
+    except Exception as e:
+        print(f"[script_generator] Surgical update failed: {e}")
+        return full_file
+
+
 
 # ── Public API ────────────────────────────────────────────────────────────────
 
@@ -900,6 +997,7 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
     Create or update scripts for one feature.
     Respects ENABLE_K6, ENABLE_SELENIUM, ENABLE_LOADRUNNER flags.
     Uses templates on CREATE (no AI), AI only on UPDATE (webhook-triggered).
+    Registers every Selenium script in the selenium index after write.
     """
     root   = _script_root(repo, env)
     fslug  = _slug(feature.path)
@@ -920,43 +1018,15 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
             _write(k6_path, _k6_template(feature, env))
     result.k6_validated = True
 
-    # ── Selenium (Java Maven) ─────────────────────────────────────────────────
+    # ── Selenium — routed through _generate_selenium_java ────────────────────
+    # This function handles CREATE vs UPDATE, surgical updates, and index registration
     if enable_sel:
-        sel_root   = os.path.join(root, "selenium")
-        class_name = _java_class_name(feature.path)
-        test_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
-        page_dir   = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "pages")
-        res_dir    = os.path.join(sel_root, "src", "test", "resources")
-        for d in [test_dir, page_dir, res_dir,
-                  os.path.join(sel_root, "src", "main", "java")]:
-            os.makedirs(d, exist_ok=True)
-
-        if not os.path.exists(os.path.join(sel_root, "pom.xml")):
-            _write(os.path.join(sel_root, "pom.xml"), _selenium_pom())
-        if not os.path.exists(os.path.join(test_dir, "BaseTest.java")):
-            _write(os.path.join(test_dir, "BaseTest.java"),
-                   _selenium_base_test(os.getenv("SFCC_SITE_URL", BASE_URL)))
-
-        page_path = os.path.join(page_dir, f"{class_name}Page.java")
-        test_path = os.path.join(test_dir, f"{class_name}Test.java")
-
-        if os.path.exists(test_path) and _openai_available():
-            # UPDATE via AI — only on webhook-triggered change
-            _write(page_path, _update_selenium_java_ai(
-                open(page_path, encoding="utf-8").read() if os.path.exists(page_path) else "",
-                feature, "page", class_name))
-            _write(test_path, _update_selenium_java_ai(
-                open(test_path, encoding="utf-8").read(), feature, "test", class_name))
-        else:
-            # CREATE via template — zero AI calls
-            if not os.path.exists(page_path):
-                _write(page_path, _selenium_page_template(class_name, feature))
-            if not os.path.exists(test_path):
-                _write(test_path, _selenium_test_template(class_name, feature))
-
-        existing_tests = [f.replace(".java", "") for f in os.listdir(test_dir)
-                          if f.endswith("Test.java") and f != "BaseTest.java"]
-        _write(os.path.join(res_dir, "testng.xml"), _selenium_testng_xml(existing_tests))
+        sel_root = os.path.join(root, "selenium")
+        test_path = _generate_selenium_java(
+            feature,
+            sel_root=sel_root,
+            base_url=os.getenv("SFCC_SITE_URL", BASE_URL),
+        )
         result.selenium_path = test_path
 
     # LoadRunner path set here — journey generated once in generate_all
@@ -1114,6 +1184,7 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
     Generate/update scripts for all features.
     Skips paths that produce no meaningful slug (e.g. '/', '/{id}').
     Also generates one combined LoadRunner journey script for all features.
+    After all scripts written, ensures selenium index is up to date.
     """
     results = []
     meaningful = [f for f in features if _is_meaningful_path(f.path)]
@@ -1129,5 +1200,13 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
     # Generate one combined LoadRunner journey script covering all endpoints
     if meaningful and os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true":
         _generate_lr_journey(meaningful, env, repo)
+
+    # Ensure selenium index reflects everything on disk after batch generation
+    if meaningful and os.getenv("ENABLE_SELENIUM", "true").lower() == "true":
+        sel_root = os.path.join(_script_root(repo, env), "selenium")
+        if os.path.isdir(sel_root):
+            from agent.selenium_index import get_or_build_index
+            get_or_build_index(sel_root)
+            print(f"[script_generator] Selenium index refreshed: {sel_root}")
 
     return results

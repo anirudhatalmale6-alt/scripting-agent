@@ -437,6 +437,20 @@ def _process_commit(
         features_to_generate = _filter_features_by_impact(
             change_report.feature_changes, impact_map
         )
+
+        # ── Selenium index: find existing scripts affected by this change ─────
+        from agent.selenium_index import get_or_build_index, find_scripts_for_changed_files
+        from agent.script_generator import _script_root, repo_slug
+        sel_root = os.path.join(_script_root(_repo, _env), "selenium")
+        sel_index = get_or_build_index(sel_root)
+        filenames = [f.get("filename", "") if isinstance(f, dict) else f for f in changed_files]
+        affected_sel = find_scripts_for_changed_files(filenames, sel_index, policy)
+        if affected_sel:
+            log.info(
+                f"[orchestrator] {sha[:8]}: index found {len(affected_sel)} affected "
+                f"Selenium scripts — targeted update only"
+            )
+
         log.info(
             f"[orchestrator] {sha[:8]}: {len(features_to_generate)} feature(s) "
             f"to generate for {_repo}"
@@ -553,6 +567,13 @@ def scan_full_repo(repo: str = None, env: str = None) -> OrchestrationResult:
         return result
 
     result.generated_scripts = generate_all(all_features, env=_env, repo=_repo)
+
+    # Build selenium index after full scan
+    from agent.selenium_index import get_or_build_index
+    from agent.script_generator import _script_root
+    sel_root = os.path.join(_script_root(_repo, _env), "selenium")
+    get_or_build_index(sel_root)
+    log.info(f"[orchestrator] Selenium index built for {_repo}")
     created_paths = []
     for gs in result.generated_scripts:
         created_paths += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
