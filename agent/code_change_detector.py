@@ -134,6 +134,25 @@ SOURCE_EXTENSIONS = {
     ".cr",                                   # Crystal/Kemal
     ".nim",                                  # Nim
     ".dart",                                 # Dart/Shelf
+    # ── UI / Template files ───────────────────────────────────────────────────
+    ".html", ".htm",                         # HTML templates
+    ".jinja", ".jinja2", ".j2",              # Jinja templates
+    ".hbs", ".handlebars",                   # Handlebars
+    ".ejs",                                  # EJS
+    ".vue",                                  # Vue SFC
+    ".svelte",                               # Svelte
+    ".erb",                                  # Rails ERB
+    ".haml",                                 # HAML
+    ".pug", ".jade",                         # Pug/Jade
+    ".twig",                                 # Twig (PHP)
+    ".blade.php",                            # Laravel Blade (caught by .php too)
+    ".liquid",                               # Liquid (Shopify)
+    ".mustache",                             # Mustache
+    ".njk",                                  # Nunjucks
+    ".astro",                                # Astro
+    ".mdx",                                  # MDX
+    # ── Style / Config that affects UI ───────────────────────────────────────
+    ".css", ".scss", ".sass", ".less",       # Stylesheets
 }
 
 
@@ -361,10 +380,58 @@ Code:
         return []
 
 
-def _is_source_file(filename: str) -> bool:
-    """Returns True for any known backend/API source file extension."""
+UI_EXTENSIONS = {
+    ".html", ".htm", ".jinja", ".jinja2", ".j2", ".hbs", ".handlebars",
+    ".ejs", ".vue", ".svelte", ".erb", ".haml", ".pug", ".jade",
+    ".twig", ".liquid", ".mustache", ".njk", ".astro", ".mdx",
+    ".css", ".scss", ".sass", ".less",
+}
+
+
+def _is_ui_file(filename: str) -> bool:
+    """Returns True for UI/template files that affect Selenium tests."""
     ext = os.path.splitext(filename)[1].lower()
-    return ext in SOURCE_EXTENSIONS
+    # Also catch .blade.php
+    if filename.endswith(".blade.php"):
+        return True
+    return ext in UI_EXTENSIONS
+
+
+def _ui_feature_from_file(filename: str, patch: str) -> Optional["FeatureChange"]:
+    """
+    For UI/template files, create a FeatureChange representing the page
+    that changed. Used to trigger Selenium script updates.
+    """
+    # Derive a page path from the filename
+    # e.g. templates/checkout/index.html → /checkout
+    #      src/views/login.vue           → /login
+    #      pages/about.html              → /about
+    parts = filename.replace("\\", "/").split("/")
+    # Strip common prefix dirs
+    skip_dirs = {"templates", "views", "pages", "src", "app",
+                 "static", "public", "resources", "assets", "components"}
+    meaningful = [p for p in parts if p.lower() not in skip_dirs]
+
+    if meaningful:
+        # Use the last meaningful part without extension as the page name
+        page = os.path.splitext(meaningful[-1])[0].lower()
+        # Skip generic names
+        if page in ("index", "base", "layout", "main", "app", "root"):
+            if len(meaningful) > 1:
+                page = meaningful[-2].lower()
+            else:
+                page = "home"
+        path = f"/{page}"
+    else:
+        path = "/home"
+
+    return FeatureChange(
+        file=filename,
+        method="GET",
+        path=path,
+        description=f"UI change in {filename} — page content updated",
+        tech_stack="UI/Template",
+    )
 
 
 def detect_tech_stack(filename: str, diff_text: str = "") -> str:
@@ -459,32 +526,27 @@ def detect_tech_stack(filename: str, diff_text: str = "") -> str:
     return stack
 
 
-def _is_dependency_file(filename: str) -> bool:
-    return os.path.basename(filename) in DEPENDENCY_FILES
+def _is_source_file(filename: str) -> bool:
+    """Returns True for any known backend/API source file extension."""
+    ext = os.path.splitext(filename)[1].lower()
+    return ext in SOURCE_EXTENSIONS
 
-
-# ── Public API ────────────────────────────────────────────────────────────────
 
 def detect_changes(diff_text: str, changed_files: list) -> ChangeReport:
     """
     Main entry point.
 
-    Parameters
-    ----------
-    diff_text     : Full unified diff string from the GitHub API.
-    changed_files : List of dicts from GitHub's /pulls/{n}/files endpoint,
-                    each with at least {"filename": str, "status": str, "patch": str}.
-
-    Returns
-    -------
-    ChangeReport with dependency_changes and feature_changes populated.
+    Scenarios handled:
+      A — dependency file changed (requirements.txt, package.json, etc.)
+      B — source file added/modified with new route decorators
+      C — UI/template file changed (HTML, Vue, Svelte, etc.) → Selenium update
     """
     report = ChangeReport()
 
     for file_info in changed_files:
         filename = file_info.get("filename", "")
-        patch = file_info.get("patch", "") or ""
-        status = file_info.get("status", "modified")  # added | modified | removed
+        patch    = file_info.get("patch", "") or ""
+        status   = file_info.get("status", "modified")
 
         # ── Scenario A: dependency upgrade ───────────────────────────────────
         if _is_dependency_file(filename):
@@ -492,14 +554,21 @@ def detect_changes(diff_text: str, changed_files: list) -> ChangeReport:
             report.dependency_changes.extend(deps)
             print(f"[detector] Dependency changes in {filename}: {len(deps)} packages")
 
-        # ── Scenario B: new feature / endpoint ───────────────────────────────
-        elif _is_source_file(filename) and status in ("added", "modified"):
-            stack = detect_tech_stack(filename, patch)
+        # ── Scenario B: source file with route decorators ────────────────────
+        elif _is_source_file(filename) and not _is_ui_file(filename) \
+                and status in ("added", "modified"):
+            stack    = detect_tech_stack(filename, patch)
             features = _parse_feature_diff(filename, patch)
             report.feature_changes.extend(features)
             print(f"[detector] Feature changes in {filename} ({stack}): {len(features)} endpoints")
 
-    # Generate a human-readable diff summary via GPT for the final report
+        # ── Scenario C: UI/template file changed ─────────────────────────────
+        elif _is_ui_file(filename) and status in ("added", "modified"):
+            feature = _ui_feature_from_file(filename, patch)
+            if feature:
+                report.feature_changes.append(feature)
+                print(f"[detector] UI change in {filename} → page {feature.path}")
+
     if diff_text:
         report.raw_diff_summary = _summarise_diff(diff_text)
 

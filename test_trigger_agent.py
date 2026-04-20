@@ -106,12 +106,8 @@ def github_webhook():
                     f"risk={impact_map.get('risk_level')}, "
                     f"k6={impact_map.get('test_updates_needed', {}).get('k6')}"
                 )
-                # Skip if all files are docs/config with no test impact
-                if not impact_map.get("changed_domains") and not impact_map.get("test_updates_needed", {}).get("k6"):
-                    all_skipped = all(should_skip_file(f, policy) for f in changed_files if f)
-                    if all_skipped:
-                        log.info("[webhook] All changed files skipped per routing rules")
-                        return jsonify({"message": "Skipped — docs/config only change"}), 200
+                # Only skip if ALL files are pure docs AND no scripts exist yet
+                # Never skip if scripts already exist — every commit may update them
         except Exception as e:
             log.warning(f"[webhook] Impact map failed: {e}")
 

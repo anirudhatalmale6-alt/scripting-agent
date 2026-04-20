@@ -285,6 +285,7 @@ def _filter_features_by_impact(features: list, impact_map: dict) -> list:
     """
     Use the impact map to keep only features whose domain is in the affected list.
     Falls back to all features if impact map is empty (no .perf/mappings.yaml).
+    UI/template changes always pass through — they always need Selenium updates.
     """
     affected_domains = impact_map.get("changed_domains", [])
     if not affected_domains:
@@ -292,11 +293,18 @@ def _filter_features_by_impact(features: list, impact_map: dict) -> list:
 
     filtered = []
     for f in features:
+        # Always include UI/template changes — they need Selenium updates regardless
+        if getattr(f, "tech_stack", "") == "UI/Template":
+            filtered.append(f)
+            continue
+
         path_lower = f.path.lower()
-        # Check if any affected domain keyword appears in the endpoint path
+        file_lower = getattr(f, "file", "").lower()
+
+        # Check if any affected domain keyword appears in the endpoint path or file
         for domain in affected_domains:
             domain_keyword = domain.replace("-domain", "").lower()
-            if domain_keyword in path_lower or domain_keyword in f.file.lower():
+            if domain_keyword in path_lower or domain_keyword in file_lower:
                 filtered.append(f)
                 break
         else:
@@ -309,15 +317,20 @@ def _filter_features_by_impact(features: list, impact_map: dict) -> list:
         f"[orchestrator] Routing: {len(features)} features → "
         f"{len(filtered)} after domain filter (domains: {affected_domains})"
     )
-    return filtered if filtered else features  # never return empty — fallback to all
+    # Never return empty — if filtering removed everything, fall back to all
+    return filtered if filtered else features
 
 
 def _should_skip_change(changed_files: list, policy: PerfPolicy) -> bool:
-    """Return True if ALL changed files should be skipped per routing rules."""
+    """
+    Return True only if there are literally no changed files.
+    Every commit with actual file changes should trigger script generation —
+    even docs changes may affect page titles, UI content, or test data.
+    """
     if not changed_files:
-        return False
+        return True
     filenames = [f.get("filename", "") if isinstance(f, dict) else f for f in changed_files]
-    return all(should_skip_file(fn, policy) for fn in filenames if fn)
+    return not any(fn for fn in filenames if fn)  # skip only if all filenames are empty
 
 
 # ── Auto-fix pre-existing failures ───────────────────────────────────────────
@@ -440,8 +453,8 @@ def _process_commit(
 
         # ── Selenium index: find existing scripts affected by this change ─────
         from agent.selenium_index import get_or_build_index, find_scripts_for_changed_files
-        from agent.script_generator import _script_root, repo_slug
-        sel_root = os.path.join(_script_root(_repo, _env), "selenium")
+        from agent.script_generator import _script_root
+        sel_root  = os.path.join(_script_root(_repo, _env), "selenium")
         sel_index = get_or_build_index(sel_root)
         filenames = [f.get("filename", "") if isinstance(f, dict) else f for f in changed_files]
         affected_sel = find_scripts_for_changed_files(filenames, sel_index, policy)
@@ -462,8 +475,42 @@ def _process_commit(
                 scripts_updated += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
             else:
                 scripts_created += [gs.k6_path, gs.loadrunner_path, gs.selenium_path]
+
     else:
-        log.info(f"[orchestrator] {sha[:8]}: no feature changes detected")
+        # ── No new endpoints detected — but still update existing scripts ─────
+        # The commit may have changed UI, logic, or content without adding routes.
+        # Use the selenium index to find and update affected existing scripts.
+        log.info(f"[orchestrator] {sha[:8]}: no new endpoints — checking index for affected scripts")
+        from agent.selenium_index import get_or_build_index, find_scripts_for_changed_files
+        from agent.script_generator import _script_root
+        sel_root  = os.path.join(_script_root(_repo, _env), "selenium")
+        sel_index = get_or_build_index(sel_root)
+        filenames = [f.get("filename", "") if isinstance(f, dict) else f for f in changed_files]
+        affected_sel = find_scripts_for_changed_files(filenames, sel_index, policy)
+
+        if affected_sel:
+            log.info(
+                f"[orchestrator] {sha[:8]}: updating {len(affected_sel)} existing "
+                f"Selenium scripts via index"
+            )
+            from agent.code_change_detector import FeatureChange
+            # Create synthetic features from the index entries to drive updates
+            synthetic_features = []
+            for entry in affected_sel:
+                for ep in entry.get("endpoints", []):
+                    synthetic_features.append(FeatureChange(
+                        file=filenames[0] if filenames else "",
+                        method=ep.get("method", "GET"),
+                        path=ep.get("path", "/"),
+                        description=f"Updated via commit {sha[:8]}",
+                        tech_stack="",
+                    ))
+            if synthetic_features:
+                generated = generate_all(synthetic_features, env=_env, repo=_repo)
+                scripts_updated += [gs.selenium_path for gs in generated if gs.selenium_path]
+                log.info(f"[orchestrator] {sha[:8]}: updated {len(generated)} scripts")
+        else:
+            log.info(f"[orchestrator] {sha[:8]}: no affected scripts found — checkpoint anchored")
 
     if change_report.needs_action:
         patches = patch_all(change_report, repo=_repo)
@@ -661,6 +708,30 @@ def orchestrate(
                     change_report.feature_changes, _impact_map
                 )
                 result.generated_scripts = generate_all(features, env=_env, repo=_repo)
+            else:
+                # No new endpoints — update existing scripts via index
+                from agent.selenium_index import get_or_build_index, find_scripts_for_changed_files
+                from agent.script_generator import _script_root
+                from agent.code_change_detector import FeatureChange
+                sel_root  = os.path.join(_script_root(_repo, _env), "selenium")
+                sel_index = get_or_build_index(sel_root)
+                filenames = [f.get("filename", "") for f in changed_files]
+                affected_sel = find_scripts_for_changed_files(filenames, sel_index, policy)
+                if affected_sel:
+                    synthetic = [
+                        FeatureChange(
+                            file=filenames[0] if filenames else "",
+                            method=ep.get("method", "GET"),
+                            path=ep.get("path", "/"),
+                            description=f"Updated via PR #{pr_number}",
+                            tech_stack="",
+                        )
+                        for entry in affected_sel
+                        for ep in entry.get("endpoints", [])
+                    ]
+                    if synthetic:
+                        result.generated_scripts = generate_all(synthetic, env=_env, repo=_repo)
+                        log.info(f"[orchestrator] PR #{pr_number}: updated {len(result.generated_scripts)} scripts via index")
 
             if change_report.needs_action:
                 result.patch_results = patch_all(change_report, repo=_repo)
