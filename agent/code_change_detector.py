@@ -526,6 +526,10 @@ def detect_tech_stack(filename: str, diff_text: str = "") -> str:
     return stack
 
 
+def _is_dependency_file(filename: str) -> bool:
+    return os.path.basename(filename) in DEPENDENCY_FILES
+
+
 def _is_source_file(filename: str) -> bool:
     """Returns True for any known backend/API source file extension."""
     ext = os.path.splitext(filename)[1].lower()
