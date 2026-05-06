@@ -288,7 +288,10 @@ def _parse_feature_diff(filename: str, diff_text: str) -> List[FeatureChange]:
 
             # Prepend router prefix if path is relative (e.g. "/" → "/users/")
             if prefix and not path.startswith(prefix):
-                path = prefix + ("" if path.startswith("/") else "/") + path.lstrip("/")
+                if path.startswith("/"):
+                    path = prefix + path
+                else:
+                    path = prefix + "/" + path
 
             # Normalise double slashes
             path = re.sub(r'/+', '/', path)
