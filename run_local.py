@@ -1,18 +1,15 @@
 """
 run_local.py
 ────────────
-Run the full AI Performance Agent stack locally without Docker.
+Run the AI Scripting Agent stack locally without Docker.
 
 Starts:
   - MCP Server        → http://localhost:5002
   - Test Trigger Agent → http://localhost:5001
-  - RCA Agent          → http://localhost:5000
 
 Prerequisites (install once):
   pip install -r requirements.txt
-  # k6:     https://k6.io/docs/get-started/installation/
-  # Java 11: https://adoptium.net
-  # Maven:   https://maven.apache.org/download.cgi
+  # k6 (optional): https://k6.io/docs/get-started/installation/
 
 Usage:
   python run_local.py
@@ -103,15 +100,12 @@ if __name__ == "__main__":
     start("MCP Server",          ["mcp_server.py"])
     time.sleep(2)
     start("Test Trigger Agent",  ["test_trigger_agent.py"])
-    time.sleep(1)
-    start("RCA Agent",           ["rca_agent.py"])
 
     print()
     print("=" * 60)
     print("  All services started:")
     print("  MCP Server         → http://localhost:5002")
     print("  Test Trigger Agent → http://localhost:5001")
-    print("  RCA Agent          → http://localhost:5000")
     print()
     print("  Webhook URL for GitHub:")
     print("  http://localhost:5001/github-webhook")
@@ -127,12 +121,10 @@ if __name__ == "__main__":
         time.sleep(5)
         for name, p in processes:
             if p.poll() is not None:
-                print(f"[run_local] ⚠️  {name} exited (code {p.returncode}) — restarting...")
+                print(f"[run_local] {name} exited (code {p.returncode}) — restarting...")
                 processes.remove((name, p))
                 if name == "MCP Server":
                     start("MCP Server", ["mcp_server.py"])
                 elif name == "Test Trigger Agent":
                     start("Test Trigger Agent", ["test_trigger_agent.py"])
-                elif name == "RCA Agent":
-                    start("RCA Agent", ["rca_agent.py"])
                 break

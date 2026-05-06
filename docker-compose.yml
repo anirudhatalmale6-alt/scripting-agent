@@ -1,16 +1,16 @@
 # =============================================================================
-# AI Performance Agent — Local Docker Stack
+# AI Scripting Agent — Local Docker Stack
 #
-# Agents watch GITHUB_REPO in .env for changes and generate/maintain
-# test scripts. The target app runs separately — set SFCC_SITE_URL in .env.
+# Watches GITHUB_REPOS in .env for changes and generates/maintains
+# k6, LoadRunner, and Selenium test scripts.
+# The target app (testrepo) runs separately — set SFCC_SITE_URL in .env.
 #
 # Usage:
 #   docker-compose up --build
 #   docker-compose logs -f test-trigger-agent
 #
-# Webhooks:
+# Webhook:
 #   Test Trigger → POST http://localhost:5001/github-webhook
-#   RCA Agent    → POST http://localhost:5000/github-webhook
 # =============================================================================
 
 services:
@@ -24,7 +24,7 @@ services:
       - "5002:5002"
     env_file: .env
     environment:
-      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_SERVER_URL: ""
       K6_PROMETHEUS_RW_USERNAME: ""
       K6_PROMETHEUS_RW_PASSWORD: ""
     volumes:
@@ -36,9 +36,6 @@ services:
       - ./PERF_AGENTS.md:/app/PERF_AGENTS.md:ro
       - ./SCRIPTING_AGENT.md:/app/SCRIPTING_AGENT.md:ro
       - ./PERF_EXEC_AGENT.md:/app/PERF_EXEC_AGENT.md:ro
-    depends_on:
-      prometheus:
-        condition: service_started
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "curl", "-f", "http://localhost:5002/"]
@@ -56,12 +53,9 @@ services:
       - "5001:5001"
     env_file: .env
     environment:
-      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
+      K6_PROMETHEUS_RW_SERVER_URL: ""
       K6_PROMETHEUS_RW_USERNAME: ""
       K6_PROMETHEUS_RW_PASSWORD: ""
-      GRAFANA_RW_URL: http://prometheus:9090/api/v1/write
-      GRAFANA_USERNAME: ""
-      GRAFANA_API_KEY: ""
       MCP_URL: http://mcp-server:5002
       CHECKPOINT_DIR: /app/checkpoints
     volumes:
@@ -74,8 +68,6 @@ services:
       - ./SCRIPTING_AGENT.md:/app/SCRIPTING_AGENT.md:ro
       - ./PERF_EXEC_AGENT.md:/app/PERF_EXEC_AGENT.md:ro
     depends_on:
-      prometheus:
-        condition: service_started
       mcp-server:
         condition: service_healthy
     restart: unless-stopped
@@ -85,92 +77,3 @@ services:
       timeout: 5s
       retries: 5
       start_period: 10s
-
-  # ── RCA Agent ─────────────────────────────────────────────────────────────
-  rca-agent:
-    build: .
-    container_name: rca-agent
-    command: python rca_agent.py
-    ports:
-      - "5010:5000"
-    env_file: .env
-    environment:
-      K6_PROMETHEUS_RW_SERVER_URL: http://prometheus:9090/api/v1/write
-      K6_PROMETHEUS_RW_USERNAME: ""
-      K6_PROMETHEUS_RW_PASSWORD: ""
-      GRAFANA_RW_URL: http://prometheus:9090/api/v1/write
-      GRAFANA_USERNAME: ""
-      GRAFANA_API_KEY: ""
-      MCP_URL: http://mcp-server:5002
-      CHECKPOINT_DIR: /app/checkpoints
-    volumes:
-      - ./logs:/app/logs
-      - ./scripts:/app/scripts
-      - ./reports:/app/reports
-      - ./checkpoints:/app/checkpoints
-      - ./.perf:/app/.perf:ro
-      - ./PERF_AGENTS.md:/app/PERF_AGENTS.md:ro
-      - ./SCRIPTING_AGENT.md:/app/SCRIPTING_AGENT.md:ro
-      - ./PERF_EXEC_AGENT.md:/app/PERF_EXEC_AGENT.md:ro
-    depends_on:
-      prometheus:
-        condition: service_started
-      mcp-server:
-        condition: service_healthy
-    restart: unless-stopped
-    healthcheck:
-      test: ["CMD", "curl", "-f", "http://localhost:5000/"]
-      interval: 15s
-      timeout: 5s
-      retries: 5
-      start_period: 10s
-
-  # ── Prometheus ────────────────────────────────────────────────────────────
-  prometheus:
-    image: prom/prometheus:latest
-    container_name: prometheus
-    ports:
-      - "9090:9090"
-    command:
-      - "--config.file=/etc/prometheus/prometheus.yml"
-      - "--web.enable-remote-write-receiver"
-      - "--storage.tsdb.retention.time=7d"
-    volumes:
-      - ./config/prometheus.yml:/etc/prometheus/prometheus.yml:ro
-      - prometheus_data:/prometheus
-    restart: unless-stopped
-
-  # ── Grafana ───────────────────────────────────────────────────────────────
-  grafana:
-    image: grafana/grafana:latest
-    container_name: grafana
-    ports:
-      - "3000:3000"
-    environment:
-      GF_SECURITY_ADMIN_USER: admin
-      GF_SECURITY_ADMIN_PASSWORD: admin
-      GF_AUTH_ANONYMOUS_ENABLED: "true"
-      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
-    volumes:
-      - grafana_data:/var/lib/grafana
-      - ./config/grafana/provisioning:/etc/grafana/provisioning:ro
-    depends_on:
-      - prometheus
-    restart: unless-stopped
-
-  # ── Filebrowser ───────────────────────────────────────────────────────────
-  filebrowser:
-    image: filebrowser/filebrowser:latest
-    container_name: filebrowser
-    ports:
-      - "8888:80"
-    volumes:
-      - .:/srv
-      - filebrowser_data:/database
-    command: --noauth --root /srv --database /database/filebrowser.db --port 80
-    restart: unless-stopped
-
-volumes:
-  prometheus_data:
-  grafana_data:
-  filebrowser_data:
