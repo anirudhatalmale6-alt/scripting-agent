@@ -1,19 +1,29 @@
 """
 test_trigger_agent.py
 ─────────────────────
-Test Trigger Agent — decoupled from RCA.
+AI Scripting Agent — generates k6, LoadRunner, and Selenium test scripts
+by scanning source code for HTTP endpoints.
 
-Responsibilities:
-  - Receive GitHub webhook (push / PR)
-  - Detect code changes (Scenario A: dep upgrade, Scenario B: new feature)
-  - Generate new k6 / LoadRunner / Selenium scripts
-  - Patch existing scripts
-  - Track processed commits in .commit_checkpoint.json
-  - Post script-change summary to PR comment + Slack
+Modes:
+  LOCAL  — set LOCAL_REPO_PATH to a directory containing source code.
+           The agent scans all source files, detects endpoints, and
+           generates test scripts. No GitHub needed.
+
+  GITHUB — set GITHUB_REPOS to monitor repos via webhooks.
+           POST http://localhost:5001/github-webhook
+
+Endpoints:
+  GET  /              → health check
+  POST /scan          → trigger a local rescan (LOCAL mode)
+  POST /github-webhook→ receive GitHub push/PR events (GITHUB mode)
+  POST /run-tests     → run all generated k6 + Selenium tests
+  POST /self-heal     → find and fix failing scripts via AI
+  GET  /checkpoint    → show commit processing history
+  POST /checkpoint/reset → reset checkpoint
 
 Run:
   python test_trigger_agent.py          (port 5001)
-  docker-compose up test-trigger-agent
+  docker-compose up --build
 """
 
 import json
@@ -25,12 +35,17 @@ from datetime import datetime
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
 
-from agent.commit_tracker import get_checkpoint, get_full_report
+from agent.commit_tracker import get_checkpoint, get_full_report, save_checkpoint
 from agent.concurrency import WebhookQueue
-from agent.test_orchestrator import orchestrate
-from agent.perf_policy import load_policy, build_impact_map, should_skip_file
-from github_reporting import comment_pr
-from slack_service import send_slack
+from agent.code_change_detector import (
+    FeatureChange, _parse_feature_diff, _ai_extract_features,
+    _is_source_file, _is_ui_file, _ui_feature_from_file,
+    SOURCE_EXTENSIONS,
+)
+from agent.script_generator import (
+    repo_slug, generate_scripts, generate_all,
+    _is_meaningful_path, _deduplicate_features, _slug,
+)
 
 load_dotenv()
 
@@ -54,26 +69,179 @@ log = logging.getLogger("test_trigger")
 app = Flask(__name__)
 _queue = WebhookQueue()
 
-GITHUB_REPO  = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()  # primary repo for backward compat
-SLACK_WEBHOOK = os.getenv("SLACK_WEBHOOK", "")
+LOCAL_REPO_PATH = os.getenv("LOCAL_REPO_PATH", "").strip()
+GITHUB_REPO     = os.getenv("GITHUB_REPOS", "").split(",")[0].strip()
+SLACK_WEBHOOK   = os.getenv("SLACK_WEBHOOK", "")
+REPO_NAME       = os.getenv("REPO_NAME", "local-repo")
 
 
-# ── Webhook ───────────────────────────────────────────────────────────────────
+# ══════════════════════════════════════════════════════════════════════════════
+# LOCAL SCAN MODE — no GitHub needed
+# ══════════════════════════════════════════════════════════════════════════════
+
+def _scan_local_directory(repo_path: str) -> list:
+    """
+    Walk a local directory and find all source files that may contain
+    HTTP endpoints. Returns list of (filepath, content) tuples.
+    """
+    source_files = []
+    for root, dirs, files in os.walk(repo_path):
+        # Skip hidden dirs, venv, node_modules, __pycache__
+        dirs[:] = [d for d in dirs if not d.startswith('.')
+                   and d not in ('venv', 'env', 'node_modules', '__pycache__',
+                                 '.git', 'dist', 'build', '.tox', '.mypy_cache')]
+        for fname in files:
+            ext = os.path.splitext(fname)[1].lower()
+            if ext in SOURCE_EXTENSIONS:
+                full_path = os.path.join(root, fname)
+                try:
+                    with open(full_path, 'r', encoding='utf-8', errors='ignore') as f:
+                        content = f.read()
+                    rel_path = os.path.relpath(full_path, repo_path)
+                    source_files.append((rel_path, content))
+                except Exception:
+                    continue
+    return source_files
+
+
+def _detect_endpoints_from_source(source_files: list) -> list:
+    """
+    Analyse source files and extract all HTTP endpoints.
+    Uses regex pattern matching + optional AI fallback.
+    Returns list of FeatureChange objects.
+    """
+    seen = set()
+    all_features = []
+
+    for rel_path, content in source_files:
+        if _is_ui_file(rel_path):
+            feature = _ui_feature_from_file(rel_path, content)
+            if feature:
+                key = (feature.method, feature.path)
+                if key not in seen:
+                    seen.add(key)
+                    all_features.append(feature)
+            continue
+
+        if not _is_source_file(rel_path):
+            continue
+
+        features = _parse_feature_diff(rel_path, content)
+        if not features and len(content) > 50:
+            features = _ai_extract_features(rel_path, content[:4000])
+
+        for feat in features:
+            key = (feat.method, feat.path)
+            if key not in seen:
+                seen.add(key)
+                all_features.append(feat)
+
+    return all_features
+
+
+def local_scan(repo_path: str = None, repo_name: str = None) -> dict:
+    """
+    Full local scan pipeline:
+    1. Read all source files from LOCAL_REPO_PATH
+    2. Detect endpoints via regex + AI
+    3. Generate k6, LoadRunner, Selenium scripts
+    Returns summary dict.
+    """
+    _path = repo_path or LOCAL_REPO_PATH
+    _name = repo_name or REPO_NAME
+
+    if not _path or not os.path.isdir(_path):
+        return {"error": f"LOCAL_REPO_PATH not set or directory not found: {_path}"}
+
+    log.info(f"[local-scan] Scanning directory: {_path}")
+
+    # Step 1: find source files
+    source_files = _scan_local_directory(_path)
+    log.info(f"[local-scan] Found {len(source_files)} source files")
+
+    if not source_files:
+        return {"status": "no_source_files", "message": "No source files found in directory"}
+
+    # Step 2: detect endpoints
+    all_features = _detect_endpoints_from_source(source_files)
+    log.info(f"[local-scan] Detected {len(all_features)} endpoints")
+
+    if not all_features:
+        return {"status": "no_endpoints", "message": "No HTTP endpoints detected in source files"}
+
+    # Step 3: filter and deduplicate
+    all_features = [f for f in all_features if _is_meaningful_path(f.path)]
+    all_features = _deduplicate_features(all_features)
+    log.info(f"[local-scan] After dedup: {len(all_features)} unique endpoints")
+
+    # Step 4: generate scripts
+    env = os.getenv("ENV", "dev")
+    generated = generate_all(all_features, env=env, repo=_name)
+
+    created_paths = []
+    for gs in generated:
+        created_paths += [gs.k6_path, gs.selenium_path, gs.loadrunner_path]
+
+    # Save checkpoint
+    save_checkpoint(_name, "local-scan", {
+        "scripts_created": created_paths,
+        "scripts_updated": [],
+        "dependency_changes": [],
+        "feature_changes": [{"method": f.method, "path": f.path} for f in all_features],
+        "summary": f"Local scan: {len(source_files)} files, {len(all_features)} endpoints, {len(created_paths)} scripts.",
+    })
+
+    summary = {
+        "status": "ok",
+        "source_files_scanned": len(source_files),
+        "endpoints_detected": len(all_features),
+        "scripts_generated": len(generated),
+        "endpoints": [{"method": f.method, "path": f.path, "description": f.description}
+                      for f in all_features],
+        "scripts": created_paths,
+    }
+
+    log.info(f"[local-scan] Done: {len(all_features)} endpoints, {len(created_paths)} scripts generated")
+    return summary
+
+
+# ══════════════════════════════════════════════════════════════════════════════
+# HTTP ENDPOINTS
+# ══════════════════════════════════════════════════════════════════════════════
+
+@app.route("/scan", methods=["POST"])
+def trigger_scan():
+    """Trigger a local directory scan — generates scripts for all detected endpoints."""
+    data = request.json or {}
+    repo_path = data.get("repo_path", LOCAL_REPO_PATH)
+    repo_name = data.get("repo_name", REPO_NAME)
+
+    if not repo_path:
+        return jsonify({"error": "No repo path. Set LOCAL_REPO_PATH env var or pass repo_path in body"}), 400
+
+    def _run():
+        result = local_scan(repo_path, repo_name)
+        log.info(f"[scan] Result: {result.get('status', 'unknown')}")
+
+    threading.Thread(target=_run, daemon=True).start()
+    return jsonify({"message": "Scan started — check logs for progress"}), 202
+
 
 @app.route("/github-webhook", methods=["POST"])
 def github_webhook():
-    payload = request.json or {}
+    """Receive GitHub webhook — only active when GITHUB_REPOS is configured."""
+    if not GITHUB_REPO:
+        return jsonify({"error": "GitHub mode not configured. Set GITHUB_REPOS in .env or use /scan for local mode."}), 400
 
+    payload = request.json or {}
     branch = payload.get("ref", "")
     if branch and branch != "refs/heads/main":
         return jsonify({"message": f"Skipped branch: {branch}"}), 200
 
-    # Identify which repo this event is from
     event_repo = (payload.get("repository", {}).get("full_name") or
                   payload.get("pull_request", {}).get("head", {}).get("repo", {}).get("full_name") or
                   GITHUB_REPO)
 
-    # Check if this repo is monitored
     from agent.repo_config import is_monitored_repo
     if not is_monitored_repo(event_repo):
         log.info(f"[webhook] Repo {event_repo} not in monitored list — skipping")
@@ -85,15 +253,12 @@ def github_webhook():
     if not pr_number and not commit_sha:
         return jsonify({"message": "No PR or commit in payload"}), 200
 
-    # ── Policy-driven impact map ──────────────────────────────────────────────
+    from agent.perf_policy import load_policy, build_impact_map
+    from agent.test_orchestrator import orchestrate
+
     changed_files = []
     for commit in payload.get("commits", []):
         changed_files += commit.get("added", []) + commit.get("modified", [])
-    if not changed_files and "pull_request" in payload:
-        changed_files = [
-            f.get("filename", "") for f in
-            payload.get("pull_request", {}).get("changed_files_list", [])
-        ]
 
     impact_map = {}
     if changed_files:
@@ -101,13 +266,6 @@ def github_webhook():
             policy = load_policy()
             if policy.loaded:
                 impact_map = build_impact_map(changed_files, policy)
-                log.info(
-                    f"[webhook] Impact: domains={impact_map.get('changed_domains')}, "
-                    f"risk={impact_map.get('risk_level')}, "
-                    f"k6={impact_map.get('test_updates_needed', {}).get('k6')}"
-                )
-                # Only skip if ALL files are pure docs AND no scripts exist yet
-                # Never skip if scripts already exist — every commit may update them
         except Exception as e:
             log.warning(f"[webhook] Impact map failed: {e}")
 
@@ -119,7 +277,7 @@ def github_webhook():
         pr_number=pr_number,
         commit_sha=commit_sha,
         repo=event_repo,
-        impact_map=impact_map,   # pass policy-driven routing into orchestrator
+        impact_map=impact_map,
     )
 
     try:
@@ -131,23 +289,10 @@ def github_webhook():
     md = result.to_markdown()
     log.info(f"[webhook] {result.summary}")
 
-    # Run sandbox tests if scripts were generated/updated
-    sandbox_summary = {}
-    if result.generated_scripts:
-        try:
-            from tools.test_runner import run_all_k6, run_all_selenium, summarise
-            env = os.getenv("ENV", "dev")
-            k6_results  = run_all_k6(event_repo, env)
-            sel_results = run_all_selenium(event_repo, env)
-            sandbox_summary = summarise(k6_results + sel_results)
-            log.info(f"[webhook] Sandbox: {sandbox_summary['passed']} passed, "
-                     f"{sandbox_summary['needs_manual']} need manual review")
-        except Exception as e:
-            log.warning(f"[webhook] Sandbox test failed: {e}")
-
     # Post PR comment
     if pr_number and md:
         try:
+            from github_reporting import comment_pr
             comment_pr(pr_number, md)
         except Exception as e:
             log.warning(f"[webhook] PR comment failed: {e}")
@@ -155,341 +300,222 @@ def github_webhook():
     # Slack notification
     if SLACK_WEBHOOK and "xxxx" not in SLACK_WEBHOOK:
         try:
-            pre   = result.pre_health
-            post  = result.post_health
-            gate  = result.merge_gate
-            gate_icon = {"pass": "✅", "warn": "⚠️", "fail": "❌"}.get(gate.status, "ℹ️")
-            health_line = ""
-            if pre and post:
-                health_line = (
-                    f"\nPRE:  {len(pre.passing)} passing, {len(pre.failing)} failing"
-                    f"\nPOST: {len(post.passing)} passing, {len(post.failing)} failing"
-                    + (" ✅ All clear" if len(post.failing) == 0 else " ⚠️ Failures remain")
-                )
-            send_slack(
-                f"🧪 *Test Trigger Agent*\n{result.summary}"
-                f"\n{gate_icon} Merge gate: *{gate.status.upper()}* — {gate.reason}"
-                f"{health_line}\n\n{md[:400]}"
-            )
+            from slack_service import send_slack
+            send_slack(f"Test Trigger Agent\n{result.summary}\n{md[:400]}")
         except Exception as e:
             log.warning(f"[webhook] Slack failed: {e}")
 
     return jsonify({
-        "message":          "Test Trigger Agent executed",
+        "message":           "Test Trigger Agent executed",
         "commits_processed": result.commits_processed,
-        "summary":          result.summary,
-        "impact_map":       impact_map,
-        "merge_gate":       {
+        "summary":           result.summary,
+        "merge_gate": {
             "status":      result.merge_gate.status,
             "reason":      result.merge_gate.reason,
             "block_merge": result.merge_gate.block_merge,
-            "risk_level":  result.merge_gate.risk_level,
         },
-        "report": md,
     }), 200
 
 
 @app.route("/", methods=["GET"])
 def health():
-    from agent.repo_config import get_repos
-    repos = get_repos()
-    repo_status = {}
-    for r in repos:
-        cp = get_checkpoint(r)
-        repo_status[r] = cp[:8] if cp else None
-    return jsonify({
-        "status": "Test Trigger Agent running",
-        "repos": repos,
-        "checkpoints": repo_status,
-        "queue_depth": _queue.queue_depth,
-    })
+    mode = "local" if LOCAL_REPO_PATH else ("github" if GITHUB_REPO else "unconfigured")
+    info = {"status": "Scripting Agent running", "mode": mode}
+
+    if LOCAL_REPO_PATH:
+        info["local_repo_path"] = LOCAL_REPO_PATH
+        info["repo_name"] = REPO_NAME
+    if GITHUB_REPO:
+        from agent.repo_config import get_repos
+        repos = get_repos()
+        info["repos"] = repos
+        repo_status = {}
+        for r in repos:
+            cp = get_checkpoint(r)
+            repo_status[r] = cp[:8] if cp else None
+        info["checkpoints"] = repo_status
+
+    cp = get_checkpoint(REPO_NAME)
+    if cp:
+        info["last_scan"] = cp
+
+    return jsonify(info)
 
 
 @app.route("/checkpoint", methods=["GET"])
 def checkpoint():
-    """Return full commit processing history."""
-    return jsonify(get_full_report(GITHUB_REPO))
+    repo = REPO_NAME if LOCAL_REPO_PATH else GITHUB_REPO
+    return jsonify(get_full_report(repo))
 
 
 @app.route("/checkpoint/reset", methods=["POST"])
 def reset_checkpoint():
-    """Reset checkpoint — next push will process from scratch."""
-    from agent.commit_tracker import _get_checkpoint_file, _load
+    repo = REPO_NAME if LOCAL_REPO_PATH else GITHUB_REPO
+    from agent.commit_tracker import _checkpoint_file
     import json as _json
-    checkpoint_file = _get_checkpoint_file()
-    if os.path.exists(checkpoint_file):
-        data = _load()
-        if GITHUB_REPO in data:
-            data[GITHUB_REPO]["last_processed_sha"] = None
-            with open(checkpoint_file, "w", encoding="utf-8") as _f:
-                _json.dump(data, _f, indent=2)
+    path = _checkpoint_file(repo)
+    if os.path.exists(path):
+        data = {"repo": repo, "last_processed_sha": None, "history": []}
+        with open(path, "w", encoding="utf-8") as _f:
+            _json.dump(data, _f, indent=2)
     return jsonify({"message": "Checkpoint reset"})
 
 
 @app.route("/self-heal", methods=["POST"])
 def self_heal():
-    """Manually trigger a self-heal run — finds and fixes all failing scripts."""
+    """Find and fix all failing scripts via AI."""
     def _run():
         from agent.script_health_checker import run_pre_check
         from agent.test_orchestrator import _fix_failing_scripts
+        repo = REPO_NAME if LOCAL_REPO_PATH else GITHUB_REPO
         env = os.getenv("ENV", "dev")
-        report = run_pre_check(GITHUB_REPO, env)
+        report = run_pre_check(repo, env)
         if report.failing:
             fixed = _fix_failing_scripts(report)
-            log.info(f"[self-heal] Manual run: fixed {len(fixed)}/{len(report.failing)}")
+            log.info(f"[self-heal] Fixed {len(fixed)}/{len(report.failing)}")
         else:
-            log.info("[self-heal] Manual run: all scripts passing")
+            log.info("[self-heal] All scripts passing")
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"message": "Self-heal started — check logs for progress"}), 202
 
 
 @app.route("/run-tests", methods=["POST"])
 def run_tests():
-    """Run all k6 + Selenium scripts, AI fixes failures, returns summary."""
+    """Run all k6 + Selenium scripts. AI fixes failures automatically."""
     def _run():
-        from agent.mcp_client import call_tool
-        result = call_tool("run_tests", {
-            "repo": GITHUB_REPO,
-            "env":  os.getenv("ENV", "dev"),
-        })
-        summary = result.get("summary", {})
-        log.info(f"[run-tests] Done — {summary}")
-        if SLACK_WEBHOOK and "xxxx" not in SLACK_WEBHOOK:
-            try:
-                send_slack(
-                    f"🧪 *Test Run Complete*\n"
-                    f"✅ Passed: {summary.get('passed', 0)} | "
-                    f"⚠️ Manual: {summary.get('needs_manual', 0)} | "
-                    f"🔧 AI fixes: {summary.get('ai_fixes_used', 0)}\n"
-                    + ("\n".join(f"• `{s}`" for s in summary.get("manual_review", [])))
-                )
-            except Exception:
-                pass
+        try:
+            from tools.test_runner import run_all_k6, run_all_selenium, summarise
+            repo = REPO_NAME if LOCAL_REPO_PATH else GITHUB_REPO
+            env = os.getenv("ENV", "dev")
+            k6_results  = run_all_k6(repo, env)
+            sel_results = run_all_selenium(repo, env)
+            summary = summarise(k6_results + sel_results)
+            log.info(f"[run-tests] Done: {summary}")
+        except Exception as e:
+            log.error(f"[run-tests] Failed: {e}")
     threading.Thread(target=_run, daemon=True).start()
     return jsonify({"message": "Test run started — check logs for progress"}), 202
 
 
 if __name__ == "__main__":
-    log.info("Test Trigger Agent started on port 5001")
+    log.info("AI Scripting Agent started on port 5001")
 
-    # ── Startup: generate scripts if none exist AND no checkpoint for this repo ─
-    def _startup_generate():
+    # ── Startup: auto-scan based on mode ─────────────────────────────────────
+    def _startup():
         import time
+        time.sleep(3)
+
+        if LOCAL_REPO_PATH:
+            # LOCAL MODE — scan directory for endpoints
+            log.info(f"[startup] LOCAL MODE — scanning: {LOCAL_REPO_PATH}")
+            if not os.path.isdir(LOCAL_REPO_PATH):
+                log.error(f"[startup] Directory not found: {LOCAL_REPO_PATH}")
+                return
+            result = local_scan()
+            log.info(f"[startup] Scan complete: {result.get('endpoints_detected', 0)} endpoints, "
+                     f"{result.get('scripts_generated', 0)} scripts generated")
+            return
+
+        if GITHUB_REPO:
+            # GITHUB MODE — scan commit history
+            log.info(f"[startup] GITHUB MODE — scanning: {GITHUB_REPO}")
+            _startup_github_scan()
+            return
+
+        log.warning("[startup] No mode configured. Set LOCAL_REPO_PATH for local scanning "
+                    "or GITHUB_REPOS for GitHub monitoring.")
+
+    def _startup_github_scan():
+        """Original GitHub-based startup scan."""
+        import time
+        import requests
         from agent.repo_config import get_repos
 
         repos = get_repos()
         if not repos:
-            log.warning("[startup] No repos configured — set GITHUB_REPOS=owner/repo1,owner/repo2 in .env")
             return
 
-        time.sleep(5)  # wait for network
+        time.sleep(2)
+        token   = os.getenv("GITHUB_TOKEN", "")
+        headers = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
 
-        if len(repos) == 1:
-            # Single repo — run directly
-            log.info(f"[startup] Processing repo: {repos[0]}")
-            _startup_scan_repo(repos[0])
-        else:
-            # Multiple repos — run in parallel threads
-            log.info(f"[startup] Processing {len(repos)} repos in parallel: {repos}")
-            threads = []
-            for repo in repos:
-                t = threading.Thread(
-                    target=_startup_scan_repo,
-                    args=(repo,),
-                    name=f"startup-{repo}",
-                    daemon=True,
-                )
-                threads.append(t)
-                t.start()
-            # Wait for all to complete
-            for t in threads:
-                t.join()
-            log.info(f"[startup] All {len(repos)} repos processed")
-
-    def _startup_scan_repo(repo: str):
-        import requests
-        from agent.script_generator import repo_slug, generate_scripts, _slug
-        from agent.commit_tracker import get_checkpoint, save_checkpoint
-        from agent.code_change_detector import _parse_feature_diff, _ai_extract_features
-        import glob
-
-        env       = os.getenv("ENV", "dev")
-        rslug     = repo_slug(repo)
-        k6_dir    = os.path.join("scripts", rslug, env, "k6")
-        lr_dir    = os.path.join("scripts", rslug, env, "loadrunner")
-        sel_dir   = os.path.join("scripts", rslug, env, "selenium")
-        token     = os.getenv("GITHUB_TOKEN", "")
-        headers   = {"Authorization": f"token {token}", "Accept": "application/vnd.github+json"}
-
-        # ── Step 1: discover all endpoints in repo via commit history ─────────
-        log.info(f"[startup] Scanning commit history for endpoints in {repo}...")
-        try:
-            all_commits, page = [], 1
-            while True:
-                r = requests.get(f"https://api.github.com/repos/{repo}/commits",
-                                 headers=headers, params={"per_page": 100, "page": page}, timeout=30)
-                if r.status_code != 200 or not r.json():
-                    break
-                batch = r.json()
-                all_commits.extend(batch)
-                if len(batch) < 100:
-                    break
-                page += 1
-        except Exception as e:
-            log.error(f"[startup] Could not fetch commits for {repo}: {e}")
-            return
-
-        if not all_commits:
-            log.warning(f"[startup] No commits found for {repo}")
-            return
-
-        all_commits.reverse()  # oldest first
-        head_sha = all_commits[-1]["sha"]
-
-        # Collect all unique endpoints from commit history
-        seen, all_features = set(), []
-        for commit in all_commits:
-            sha = commit["sha"]
+        for repo in repos:
+            log.info(f"[startup] Scanning repo: {repo}")
             try:
-                r = requests.get(f"https://api.github.com/repos/{repo}/commits/{sha}",
-                                 headers=headers, timeout=15)
-                if r.status_code != 200:
-                    continue
-                for f in r.json().get("files", []):
-                    patch = f.get("patch", "")
-                    fname = f.get("filename", "")
-                    features = _parse_feature_diff(fname, patch)
-                    if not features and patch:
-                        features = _ai_extract_features(fname, patch[:3000])
-                    for feat in features:
-                        key = (feat.method, feat.path)
-                        if key not in seen:
-                            seen.add(key)
-                            all_features.append(feat)
-            except Exception:
+                all_commits, page = [], 1
+                while True:
+                    r = requests.get(f"https://api.github.com/repos/{repo}/commits",
+                                     headers=headers, params={"per_page": 100, "page": page}, timeout=30)
+                    if r.status_code != 200 or not r.json():
+                        break
+                    batch = r.json()
+                    all_commits.extend(batch)
+                    if len(batch) < 100:
+                        break
+                    page += 1
+            except Exception as e:
+                log.error(f"[startup] Could not fetch commits for {repo}: {e}")
                 continue
 
-        log.info(f"[startup] Found {len(all_features)} unique endpoints across "
-                 f"{len(all_commits)} commits")
+            if not all_commits:
+                continue
 
-        if not all_features:
-            log.warning(f"[startup] No endpoints detected for {repo}")
+            all_commits.reverse()
+            head_sha = all_commits[-1]["sha"]
+
+            seen, all_features = set(), []
+            for commit in all_commits:
+                sha = commit["sha"]
+                try:
+                    r = requests.get(f"https://api.github.com/repos/{repo}/commits/{sha}",
+                                     headers=headers, timeout=15)
+                    if r.status_code != 200:
+                        continue
+                    for f in r.json().get("files", []):
+                        patch = f.get("patch", "")
+                        fname = f.get("filename", "")
+                        features = _parse_feature_diff(fname, patch)
+                        if not features and patch:
+                            features = _ai_extract_features(fname, patch[:3000])
+                        for feat in features:
+                            key = (feat.method, feat.path)
+                            if key not in seen:
+                                seen.add(key)
+                                all_features.append(feat)
+                except Exception:
+                    continue
+
+            log.info(f"[startup] {repo}: {len(all_features)} endpoints from {len(all_commits)} commits")
+
+            if not all_features:
+                save_checkpoint(repo, head_sha, {
+                    "scripts_created": [], "scripts_updated": [],
+                    "dependency_changes": [], "feature_changes": [],
+                    "summary": "Startup: no endpoints detected.",
+                })
+                continue
+
+            all_features = [f for f in all_features if _is_meaningful_path(f.path)]
+            all_features = _deduplicate_features(all_features)
+
+            env = os.getenv("ENV", "dev")
+            generated = generate_all(all_features, env=env, repo=repo)
+            created = []
+            for gs in generated:
+                created += [gs.k6_path, gs.selenium_path, gs.loadrunner_path]
+
             save_checkpoint(repo, head_sha, {
-                "scripts_created": [], "scripts_updated": [],
-                "dependency_changes": [], "feature_changes": [],
-                "summary": "Startup: no endpoints detected.",
-            })
-            return
-
-        # Deduplicate — same resource+method keeps most specific path only
-        from agent.script_generator import _is_meaningful_path, _deduplicate_features
-        all_features = [f for f in all_features if _is_meaningful_path(f.path)]
-        all_features = _deduplicate_features(all_features)
-        log.info(f"[startup] After dedup: {len(all_features)} unique endpoints to generate")
-
-        # ── Step 2: check which scripts are missing on disk ─────────────────
-        # LR is one journey file, k6 and selenium are per-endpoint
-        lr_journey = os.path.join(lr_dir, "full_journey_lr_test.c")
-        missing = []
-        for feat in all_features:
-            slug     = _slug(feat.path)
-            k6_path  = os.path.join(k6_dir, f"{slug}_perf_test.js")
-            sel_test = os.path.join(sel_dir, "src", "test", "java", "com",
-                                    "ecommerce", "tests",
-                                    f"{feat.path.strip('/').split('/')[0].capitalize()}Test.java")
-            if not os.path.exists(k6_path) or not os.path.exists(sel_test):
-                missing.append(feat)
-
-        # Also check journey LR script (only if LR enabled)
-        lr_missing = (os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true"
-                      and not os.path.exists(lr_journey))
-
-        existing_count = len(all_features) - len(missing)
-        log.info(f"[startup] {existing_count}/{len(all_features)} endpoint scripts exist, "
-                 f"{len(missing)} need generating, LR journey: {'exists' if not lr_missing else 'missing'}")
-
-        if not missing and not lr_missing:
-            log.info("[startup] All scripts present — bootstrapping checkpoint")
-            # Also register any manually added scripts not in commit history
-            all_existing = (
-                glob.glob(os.path.join(k6_dir,  "**/*.js"),  recursive=True) +
-                glob.glob(os.path.join(lr_dir,  "**/*.c"),   recursive=True) +
-                glob.glob(os.path.join(sel_dir, "**/*.py"),  recursive=True)
-            )
-            save_checkpoint(repo, head_sha, {
-                "scripts_created": all_existing,
+                "scripts_created": created,
                 "scripts_updated": [],
                 "dependency_changes": [],
-                "feature_changes": [{"method": f.method, "path": f.path}
-                                     for f in all_features],
-                "summary": (f"Startup: {len(all_features)} endpoints from commits, "
-                            f"{len(all_existing)} total scripts on disk registered."),
+                "feature_changes": [{"method": f.method, "path": f.path} for f in all_features],
+                "summary": f"Startup: {len(all_features)} endpoints, {len(created)} scripts.",
             })
-            log.info(f"[startup] Registered {len(all_existing)} scripts "
-                     f"({len(all_features)} from commits, rest manually added)")
-            return
+            log.info(f"[startup] {repo}: generated {len(created)} scripts")
 
-        # ── Step 3: generate only missing scripts ─────────────────────────────
-        log.info(f"[startup] Generating {len(missing)} missing endpoint scripts"
-                 + (" + LR journey" if lr_missing else "") + "...")
-        created = []
-        for feat in missing:
-            try:
-                gs = generate_scripts(feat, env=env, repo=repo)
-                created += [gs.k6_path, gs.selenium_path]
-                log.info(f"[startup] Generated: {feat.method} {feat.path}")
-            except Exception as e:
-                log.error(f"[startup] Failed to generate {feat.path}: {e}")
-
-        # Generate LR journey if missing and flag enabled
-        if lr_missing and all_features and os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true":
-            try:
-                from agent.script_generator import _generate_lr_journey
-                _generate_lr_journey(all_features, env=env, repo=repo)
-                created.append(lr_journey)
-                log.info(f"[startup] Generated LR journey: {lr_journey}")
-            except Exception as e:
-                log.error(f"[startup] Failed to generate LR journey: {e}")
-        # Also pick up any manually added scripts beyond what commits detected
-        all_existing = (
-            glob.glob(os.path.join(k6_dir,  "**/*.js"),  recursive=True) +
-            glob.glob(os.path.join(lr_dir,  "**/*.c"),   recursive=True) +
-            glob.glob(os.path.join(sel_dir, "**/*.py"),  recursive=True)
-        )
-
-        save_checkpoint(repo, head_sha, {
-            "scripts_created": list(set(created + all_existing)),
-            "scripts_updated": [],
-            "dependency_changes": [],
-            "feature_changes": [{"method": f.method, "path": f.path}
-                                 for f in all_features],
-            "summary": (f"Startup gap-fill: {existing_count} existed, "
-                        f"{len(missing)} generated, "
-                        f"{len(all_existing)} total on disk registered."),
-        })
-        log.info(f"[startup] Done — {len(created)} generated, "
-                 f"{len(all_existing)} total scripts registered")
-
-        # Auto-run sandbox tests after generation if any scripts were created
-        if created and os.getenv("AUTO_TEST_ON_STARTUP", "true").lower() == "true":
-            log.info("[startup] Running sandbox tests on generated scripts...")
-            try:
-                from tools.test_runner import run_all_k6, run_all_selenium, summarise
-                k6_results  = run_all_k6(repo, env)
-                sel_results = run_all_selenium(repo, env)
-                summary = summarise(k6_results + sel_results)
-                log.info(f"[startup] Sandbox test results: "
-                         f"{summary['passed']} passed, "
-                         f"{summary['needs_manual']} need manual review, "
-                         f"{summary['ai_fixes_used']} AI fixes used")
-            except Exception as e:
-                log.error(f"[startup] Sandbox test run failed: {e}")
-
-    threading.Thread(target=_startup_generate, daemon=True).start()
+    threading.Thread(target=_startup, daemon=True).start()
 
     # ── Scheduled self-heal loop ──────────────────────────────────────────────
-    # Runs every SELF_HEAL_INTERVAL_MINUTES (default 60).
-    # Finds all failing k6 scripts and asks GPT to fix them — no commit needed.
     def _self_heal_loop():
         import time
         interval = int(os.getenv("SELF_HEAL_INTERVAL_MINUTES", "60")) * 60
@@ -498,21 +524,22 @@ if __name__ == "__main__":
             try:
                 from agent.script_health_checker import run_pre_check
                 from agent.test_orchestrator import _fix_failing_scripts
-                from agent.repo_config import get_repos
+                repo = REPO_NAME if LOCAL_REPO_PATH else GITHUB_REPO
+                if not repo:
+                    time.sleep(interval)
+                    continue
                 env = os.getenv("ENV", "dev")
-                for repo in get_repos():
-                    log.info(f"[self-heal] Health check for {repo}...")
-                    report = run_pre_check(repo, env)
-                    if report.failing:
-                        log.info(f"[self-heal] {len(report.failing)} failing in {repo} — fixing...")
-                        fixed = _fix_failing_scripts(report)
-                        log.info(f"[self-heal] Fixed {len(fixed)}/{len(report.failing)} in {repo}")
-                    else:
-                        log.info(f"[self-heal] {repo}: all {len(report.passing)} scripts passing")
+                log.info(f"[self-heal] Health check for {repo}...")
+                report = run_pre_check(repo, env)
+                if report.failing:
+                    log.info(f"[self-heal] {len(report.failing)} failing — fixing...")
+                    fixed = _fix_failing_scripts(report)
+                    log.info(f"[self-heal] Fixed {len(fixed)}/{len(report.failing)}")
+                else:
+                    log.info(f"[self-heal] All {len(report.passing)} scripts passing")
             except Exception as e:
                 log.error(f"[self-heal] Error: {e}")
             time.sleep(interval)
 
     threading.Thread(target=_self_heal_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=5001, debug=False)
-
