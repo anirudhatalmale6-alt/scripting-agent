@@ -18,10 +18,11 @@ def get_repos() -> list:
     Set GITHUB_REPOS as comma-separated list in .env:
       GITHUB_REPOS=org/repo1,org/repo2,org/repo3
     """
-    multi = os.getenv("GITHUB_REPOS", "").strip()
-    if not multi:
+    raw = os.getenv("GITHUB_REPOS", "").split("#")[0].strip()
+    if not raw:
         return []
-    return [r.strip() for r in multi.split(",") if r.strip()]
+    repos = [r.strip() for r in raw.split(",") if r.strip()]
+    return [r for r in repos if "/" in r]
 
 
 def is_monitored_repo(repo: str) -> bool:
