@@ -209,10 +209,10 @@ def local_scan(repo_path: str = None, repo_name: str = None) -> dict:
 # HTTP ENDPOINTS
 # ══════════════════════════════════════════════════════════════════════════════
 
-@app.route("/scan", methods=["POST"])
+@app.route("/scan", methods=["POST", "GET"])
 def trigger_scan():
     """Trigger a local directory scan — generates scripts for all detected endpoints."""
-    data = request.json or {}
+    data = request.get_json(silent=True) or {}
     repo_path = data.get("repo_path", LOCAL_REPO_PATH)
     repo_name = data.get("repo_name", REPO_NAME)
 
@@ -233,7 +233,7 @@ def github_webhook():
     if not GITHUB_REPO:
         return jsonify({"error": "GitHub mode not configured. Set GITHUB_REPOS in .env or use /scan for local mode."}), 400
 
-    payload = request.json or {}
+    payload = request.get_json(silent=True) or {}
     branch = payload.get("ref", "")
     if branch and branch != "refs/heads/main":
         return jsonify({"message": f"Skipped branch: {branch}"}), 200
