@@ -1,0 +1,11 @@
+venv/
+.git/
+__pycache__/
+*.pyc
+*.exe
+ngrok.exe
+logs/
+scripts/
+reports/
+checkpoints/
+*.zip

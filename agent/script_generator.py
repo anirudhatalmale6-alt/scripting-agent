@@ -46,8 +46,19 @@ from agent.selenium_index import (
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_client = None
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        key = os.getenv("OPENAI_API_KEY", "")
+        if key and "xxxxxx" not in key and key.startswith("sk-"):
+            _client = OpenAI(api_key=key)
+        else:
+            _client = OpenAI(api_key="placeholder")
+    return _client
 BASE_URL = os.getenv("SFCC_SITE_URL", "https://your-app.com")
 MAX_FIX_ITERATIONS = 5
 
@@ -293,7 +304,7 @@ def _generate_k6(feature: FeatureChange, env: str) -> str:
         elif gen_rules:
             rules_section = f"\n## Repo generation standards:\n{gen_rules[:600]}\n"
 
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Write a complete k6 JS performance test.
 Method: {feature.method} | Path: {feature.path} | Env: {env} | Domain: {domain}
@@ -329,7 +340,7 @@ def _update_k6(existing: str, feature: FeatureChange, env: str) -> str:
         elif gen_rules:
             rules_section = f"\n## Repo generation standards:\n{gen_rules[:500]}\n"
 
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Update this k6 script for the modified endpoint.
 {feature.method} {feature.path} — {feature.description} | Domain: {domain}
@@ -541,7 +552,7 @@ def _generate_loadrunner(feature: FeatureChange) -> str:
     if not _openai_available():
         return _lr_template(feature)
     try:
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Write a complete LoadRunner VuGen C script (.c file).
 Endpoint: {feature.method} {feature.path} — {feature.description}
@@ -567,7 +578,7 @@ def _update_loadrunner(existing: str, feature: FeatureChange) -> str:
     if not _openai_available():
         return existing
     try:
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Update this LoadRunner VuGen C script for the modified endpoint.
 {feature.method} {feature.path} — {feature.description}
@@ -902,7 +913,7 @@ Requirements:
 - Test page loads, URL correct, key elements visible
 - For POST/PUT/DELETE endpoints, test the HTTP response via RestAssured if appropriate
 - Return ONLY Java code, no markdown fences"""
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
@@ -921,7 +932,7 @@ def _update_selenium_java_ai(existing: str, feature: FeatureChange,
     if not _openai_available():
         return existing
     try:
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": f"""Update this Java Selenium {file_type} for the modified endpoint.
 {feature.method} {feature.path} — {feature.description}
@@ -953,7 +964,7 @@ def _update_selenium_surgical(
     if not _openai_available():
         return full_file
     try:
-        resp = client.chat.completions.create(
+        resp = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": (
                 f"Update ONLY the relevant section of this Java Selenium {file_type} "
@@ -1056,7 +1067,7 @@ def _generate_lr_journey(features: List[FeatureChange], env: str, repo: str) -> 
             endpoints_desc = "\n".join(
                 f"  {f.method} {f.path} — {f.description}" for f in sorted_features
             )
-            resp = client.chat.completions.create(
+            resp = _get_client().chat.completions.create(
                 model=OPENAI_MODEL,
                 messages=[{"role": "user", "content": f"""Update this LoadRunner VuGen C journey script for changed endpoints.
 Repo: {repo}

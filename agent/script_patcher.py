@@ -35,8 +35,19 @@ from agent.code_change_detector import DependencyChange, FeatureChange, ChangeRe
 
 load_dotenv()
 
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+_client = None
 OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+
+
+def _get_client():
+    global _client
+    if _client is None:
+        key = os.getenv("OPENAI_API_KEY", "")
+        if key and "xxxxxx" not in key and key.startswith("sk-"):
+            _client = OpenAI(api_key=key)
+        else:
+            _client = OpenAI(api_key="placeholder")
+    return _client
 
 
 def _openai_available() -> bool:
@@ -147,7 +158,7 @@ Script:
 {content}
 """
     try:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
@@ -233,7 +244,7 @@ Script:
 {content}
 """
     try:
-        response = client.chat.completions.create(
+        response = _get_client().chat.completions.create(
             model=OPENAI_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
