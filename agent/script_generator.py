@@ -1504,10 +1504,16 @@ def _deduplicate_features(features: List[FeatureChange]) -> List[FeatureChange]:
 def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = "") -> List[GeneratedScripts]:
     """
     Generate/update scripts for all features.
-    Skips paths that produce no meaningful slug (e.g. '/', '/{id}').
-    Also generates one combined LoadRunner journey script for all features.
-    After all scripts written, ensures selenium index is up to date.
+
+    Supports 3 test generation modes controlled by env vars:
+      Mode 3 (default): TEST_GEN_MODE=default — scan code, generate scripts directly
+      Mode 1: TEST_GEN_MODE=mcp, TEST_CASE_MODE=false — Playwright MCP browses live app
+      Mode 2: TEST_GEN_MODE=mcp, TEST_CASE_MODE=true — generate CSV test cases first,
+              then Playwright MCP uses CSV to drive test generation
     """
+    test_gen_mode = os.getenv("TEST_GEN_MODE", "default").lower().strip()
+    test_case_mode = os.getenv("TEST_CASE_MODE", "false").lower().strip() == "true"
+
     results = []
     meaningful = [f for f in features if _is_meaningful_path(f.path)]
     meaningful = _deduplicate_features(meaningful)
@@ -1515,6 +1521,7 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
     if skipped:
         print(f"[script_generator] Skipped {skipped} features with no meaningful path slug")
 
+    # ── Mode 3 (default): scan code → generate scripts directly ──────────────
     for feature in meaningful:
         print(f"[script_generator] {feature.method} {feature.path} → repo={repo or 'default'} env={env}")
         results.append(generate_scripts(feature, env, repo))
@@ -1534,5 +1541,34 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
             from agent.selenium_index import get_or_build_index
             get_or_build_index(sel_root)
             print(f"[script_generator] Selenium index refreshed: {sel_root}")
+
+    # ── MCP modes (Mode 1 and Mode 2) ────────────────────────────────────────
+    if test_gen_mode == "mcp" and os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true":
+        from agent.mcp_test_generator import generate_mcp_tests
+
+        target_url = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
+        root = _script_root(repo, env)
+        pw_dir = os.path.join(root, "playwright")
+        os.makedirs(pw_dir, exist_ok=True)
+
+        csv_path = None
+        if test_case_mode:
+            # Mode 2: generate CSV test cases first, then MCP
+            from agent.test_case_generator import generate_test_cases
+            repo_path = os.getenv("LOCAL_REPO_PATH", ".")
+            repo_name = os.getenv("REPO_NAME", repo or "app")
+            tc_dir = os.path.join(root, "test_cases")
+            print(f"[script_generator] MODE 2: Generating test cases CSV from {repo_path}")
+            csv_path = generate_test_cases(repo_path, tc_dir, repo_name)
+            if csv_path:
+                print(f"[script_generator] Test cases CSV: {csv_path}")
+            else:
+                print(f"[script_generator] No test cases generated — falling back to Mode 1")
+
+        mode_label = "MODE 2 (CSV + MCP)" if csv_path else "MODE 1 (MCP discovery)"
+        print(f"[script_generator] {mode_label}: Launching Playwright against {target_url}")
+        mcp_files = generate_mcp_tests(target_url, pw_dir, csv_path=csv_path)
+        for f in mcp_files:
+            print(f"[script_generator] MCP generated: {f}")
 
     return results
