@@ -29,30 +29,15 @@ import re
 import glob
 from dataclasses import dataclass
 from typing import List
-from openai import OpenAI
 from dotenv import load_dotenv
+from agent.llm_provider import get_llm_client, get_model, llm_available
 from agent.code_change_detector import DependencyChange, FeatureChange, ChangeReport
 
 load_dotenv()
 
-_client = None
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        key = os.getenv("OPENAI_API_KEY", "")
-        if key and "xxxxxx" not in key and key.startswith("sk-"):
-            _client = OpenAI(api_key=key)
-        else:
-            _client = OpenAI(api_key="placeholder")
-    return _client
-
 
 def _openai_available() -> bool:
-    key = os.getenv("OPENAI_API_KEY", "")
-    return bool(key) and "xxxxxx" not in key and key.startswith("sk-")
+    return llm_available()
 
 # Directories that contain test scripts
 SCRIPT_DIRS = ["scripts", "scripts/loadrunner", "scripts/selenium"]
@@ -158,8 +143,8 @@ Script:
 {content}
 """
     try:
-        response = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        response = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
@@ -244,8 +229,8 @@ Script:
 {content}
 """
     try:
-        response = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        response = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )

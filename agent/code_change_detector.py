@@ -27,33 +27,17 @@ from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 
 from dotenv import load_dotenv
+from agent.llm_provider import get_llm_client, get_model, llm_available
 
 load_dotenv()
 
-# ── OpenAI client (optional — graceful fallback when key not set) ─────────────
-_openai_client = None
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
 
 def _get_openai_client():
-    """Lazy-init OpenAI client; returns None when key is absent/placeholder."""
-    global _openai_client
-    if _openai_client is not None:
-        return _openai_client
-    key = os.getenv("OPENAI_API_KEY", "")
-    if key and "xxxxxx" not in key and key.startswith("sk-"):
-        try:
-            from openai import OpenAI
-            _openai_client = OpenAI(api_key=key)
-        except Exception:
-            pass
-    return _openai_client
+    return get_llm_client()
 
 
 def _openai_available() -> bool:
-    """Return True only when a real (non-placeholder) API key is set."""
-    key = os.getenv("OPENAI_API_KEY", "")
-    return bool(key) and "xxxxxx" not in key and key.startswith("sk-")
+    return llm_available()
 
 
 # ── Constants ─────────────────────────────────────────────────────────────────
@@ -357,7 +341,7 @@ Code:
         if not openai_client:
             return []
         response = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=get_model(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0,
         )
@@ -592,7 +576,7 @@ def _summarise_diff(diff_text: str) -> str:
         if not openai_client:
             return "Diff summary unavailable (OPENAI_API_KEY not configured)."
         response = openai_client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=get_model(),
             messages=[{
                 "role": "user",
                 "content": (

@@ -8,3 +8,5 @@ langsmith
 psutil
 selenium
 pyyaml
+playwright
+pytest-playwright

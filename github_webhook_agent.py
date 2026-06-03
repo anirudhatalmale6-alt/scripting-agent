@@ -2,7 +2,7 @@ from flask import Flask, request, jsonify
 import requests
 import os
 from dotenv import load_dotenv
-from openai import OpenAI
+from agent.llm_provider import get_llm_client, get_model
 from email_service import send_email
 from slack_service import send_slack
 import glob
@@ -44,7 +44,7 @@ JIRA_EMAIL = os.getenv("JIRA_EMAIL")
 JIRA_API_TOKEN = os.getenv("JIRA_API_TOKEN")
 JIRA_PROJECT_KEY = os.getenv("JIRA_PROJECT_KEY")
 
-client = OpenAI(api_key=OPENAI_API_KEY)
+client = get_llm_client()
 ENABLE_AI = os.getenv("ENABLE_AI", "true")
 GITHUB_REPO_URL = os.getenv("GITHUB_REPO_URL")
 GITHUB_TOKEN = os.getenv("GITHUB_TOKEN")

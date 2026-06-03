@@ -32,8 +32,8 @@ import re
 import subprocess
 from dataclasses import dataclass
 from typing import List, Optional, Tuple
-from openai import OpenAI
 from dotenv import load_dotenv
+from agent.llm_provider import get_llm_client, get_model, llm_available, sanitize_prompt, restore_response
 from agent.code_change_detector import FeatureChange
 from agent.perf_policy import (
     PerfPolicy, ThresholdConfig,
@@ -46,19 +46,6 @@ from agent.selenium_index import (
 
 load_dotenv()
 
-_client = None
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        key = os.getenv("OPENAI_API_KEY", "")
-        if key and "xxxxxx" not in key and key.startswith("sk-"):
-            _client = OpenAI(api_key=key)
-        else:
-            _client = OpenAI(api_key="placeholder")
-    return _client
 BASE_URL = os.getenv("SFCC_SITE_URL", "https://your-app.com")
 MAX_FIX_ITERATIONS = 5
 
@@ -131,8 +118,7 @@ def _thresholds_for(feature: FeatureChange) -> ThresholdConfig:
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
 def _openai_available() -> bool:
-    key = os.getenv("OPENAI_API_KEY", "")
-    return bool(key) and "xxxxxx" not in key and key.startswith("sk-")
+    return llm_available()
 
 
 def _slug(text: str) -> str:
@@ -215,6 +201,7 @@ class GeneratedScripts:
     k6_path: str = ""
     loadrunner_path: str = ""
     selenium_path: str = ""
+    playwright_path: str = ""
     k6_validated: bool = False
     k6_validation_attempts: int = 0
     k6_validation_error: str = ""
@@ -304,8 +291,8 @@ def _generate_k6(feature: FeatureChange, env: str) -> str:
         elif gen_rules:
             rules_section = f"\n## Repo generation standards:\n{gen_rules[:600]}\n"
 
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": f"""Write a complete k6 JS performance test.
 Method: {feature.method} | Path: {feature.path} | Env: {env} | Domain: {domain}
 {_app_context(feature)}
@@ -340,8 +327,8 @@ def _update_k6(existing: str, feature: FeatureChange, env: str) -> str:
         elif gen_rules:
             rules_section = f"\n## Repo generation standards:\n{gen_rules[:500]}\n"
 
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": f"""Update this k6 script for the modified endpoint.
 {feature.method} {feature.path} — {feature.description} | Domain: {domain}
 Keep IS_REAL_APP fallback. Use p(95)<{t.p95_ms}, rate<{t.error_rate}.
@@ -443,8 +430,8 @@ def _validate_and_fix_k6(script_path: str, feature: FeatureChange, env: str) -> 
             if not _openai_available():
                 break
             try:
-                fixed_resp = client.chat.completions.create(
-                    model=OPENAI_MODEL,
+                fixed_resp = get_llm_client().chat.completions.create(
+                    model=get_model(),
                     messages=[{"role": "user", "content": f"""Fix this failing k6 script (attempt {attempt}).
 Error: {error[:1500]}
 Requirements: valid k6 API, export const options, export default function,
@@ -552,8 +539,8 @@ def _generate_loadrunner(feature: FeatureChange) -> str:
     if not _openai_available():
         return _lr_template(feature)
     try:
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": f"""Write a complete LoadRunner VuGen C script (.c file).
 Endpoint: {feature.method} {feature.path} — {feature.description}
 {_app_context(feature)}
@@ -578,8 +565,8 @@ def _update_loadrunner(existing: str, feature: FeatureChange) -> str:
     if not _openai_available():
         return existing
     try:
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": f"""Update this LoadRunner VuGen C script for the modified endpoint.
 {feature.method} {feature.path} — {feature.description}
 {_app_context(feature)}
@@ -913,8 +900,8 @@ Requirements:
 - Test page loads, URL correct, key elements visible
 - For POST/PUT/DELETE endpoints, test the HTTP response via RestAssured if appropriate
 - Return ONLY Java code, no markdown fences"""
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": prompt}],
             temperature=0.2,
         )
@@ -932,8 +919,8 @@ def _update_selenium_java_ai(existing: str, feature: FeatureChange,
     if not _openai_available():
         return existing
     try:
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": f"""Update this Java Selenium {file_type} for the modified endpoint.
 {feature.method} {feature.path} — {feature.description}
 Keep class structure. Return ONLY Java code, no fences.
@@ -964,8 +951,8 @@ def _update_selenium_surgical(
     if not _openai_available():
         return full_file
     try:
-        resp = _get_client().chat.completions.create(
-            model=OPENAI_MODEL,
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
             messages=[{"role": "user", "content": (
                 f"Update ONLY the relevant section of this Java Selenium {file_type} "
                 f"for the modified endpoint.\n"
@@ -999,6 +986,140 @@ def _update_selenium_surgical(
         print(f"[script_generator] Surgical update failed: {e}")
         return full_file
 
+
+
+# ── Playwright (Python + pytest) ─────────────────────────────────────────────
+
+def _playwright_test_template(feature: FeatureChange, env: str) -> str:
+    path_safe = re.sub(r'\{[^}]+\}', '1', feature.path)
+    method = feature.method.upper()
+    domain = _domain_from_feature(feature)
+    test_name = _slug(feature.path)
+
+    if method in ("POST", "PUT", "PATCH", "DELETE"):
+        api_test = f'''
+def test_{test_name}_api(page):
+    """API test: {method} {feature.path}"""
+    ctx = page.context.request
+    resp = ctx.{method.lower()}(
+        f"{{BASE_URL}}{path_safe}",
+        data={{"key": "value"}},
+    )
+    assert resp.status < 500, f"Expected success, got {{resp.status}}"
+'''
+    else:
+        api_test = f'''
+def test_{test_name}_api(page):
+    """API test: {method} {feature.path}"""
+    ctx = page.context.request
+    resp = ctx.get(f"{{BASE_URL}}{path_safe}")
+    assert resp.status == 200, f"Expected 200, got {{resp.status}}"
+    assert resp.headers.get("content-type") is not None
+'''
+
+    return f'''"""
+Playwright test — {feature.method} {feature.path}
+Domain: {domain} | Env: {env}
+{feature.description}
+Run with: pytest {test_name}_test.py
+"""
+import os
+import pytest
+from playwright.sync_api import Page, expect
+
+BASE_URL = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
+
+
+def test_{test_name}_page_loads(page: Page):
+    """UI test: page at {feature.path} is reachable"""
+    page.goto(f"{{BASE_URL}}{path_safe}")
+    expect(page).not_to_have_url("about:blank")
+    assert page.title() or page.content()
+
+{api_test}
+def test_{test_name}_response_time(page: Page):
+    """Performance: response completes within threshold"""
+    import time
+    start = time.time()
+    page.goto(f"{{BASE_URL}}{path_safe}")
+    duration_ms = (time.time() - start) * 1000
+    assert duration_ms < 5000, f"Page took {{duration_ms:.0f}}ms (threshold: 5000ms)"
+'''
+
+
+def _generate_playwright(feature: FeatureChange, env: str) -> str:
+    if not _openai_available():
+        return _playwright_test_template(feature, env)
+    try:
+        domain = _domain_from_feature(feature)
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
+            messages=[{"role": "user", "content": f"""Write a complete Python Playwright pytest test file.
+Endpoint: {feature.method} {feature.path} — {feature.description}
+{_app_context(feature)}
+Requirements:
+- import from playwright.sync_api (Page, expect)
+- BASE_URL from os.getenv("SFCC_SITE_URL", "http://localhost:8000")
+- Test page loads via page.goto()
+- Test API response via page.context.request for {feature.method}
+- Test response time under 5 seconds
+- Use expect() assertions from Playwright
+- For POST/PUT/DELETE, test the API call directly
+- For GET, test both UI load and API response
+- Return ONLY Python code, no markdown fences"""}],
+            temperature=0.2,
+        )
+        return _strip_fences(resp.choices[0].message.content.strip())
+    except Exception as e:
+        print(f"[script_generator] GPT Playwright failed: {e} — using template")
+        return _playwright_test_template(feature, env)
+
+
+def _update_playwright(existing: str, feature: FeatureChange, env: str) -> str:
+    if not _openai_available():
+        return existing
+    try:
+        resp = get_llm_client().chat.completions.create(
+            model=get_model(),
+            messages=[{"role": "user", "content": f"""Update this Python Playwright pytest test for the modified endpoint.
+{feature.method} {feature.path} — {feature.description}
+Keep existing test structure. Return ONLY Python code, no fences.
+---
+{existing}"""}],
+            temperature=0,
+        )
+        return _strip_fences(resp.choices[0].message.content.strip())
+    except Exception as e:
+        print(f"[script_generator] GPT Playwright update failed: {e}")
+        return existing
+
+
+def _generate_pw_conftest(base_url: str) -> str:
+    return f'''"""
+Playwright conftest — shared fixtures for all Playwright tests.
+"""
+import os
+import pytest
+from playwright.sync_api import sync_playwright
+
+BASE_URL = os.getenv("SFCC_SITE_URL", "{base_url}")
+
+
+@pytest.fixture(scope="session")
+def browser():
+    pw = sync_playwright().start()
+    br = pw.chromium.launch(headless=True)
+    yield br
+    br.close()
+    pw.stop()
+
+
+@pytest.fixture
+def page(browser):
+    pg = browser.new_page()
+    yield pg
+    pg.close()
+'''
 
 
 # ── Public API ────────────────────────────────────────────────────────────────
@@ -1040,6 +1161,25 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
         )
         result.selenium_path = test_path
 
+    # ── Playwright ────────────────────────────────────────────────────────────
+    enable_pw = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true"
+    if enable_pw:
+        pw_dir = os.path.join(root, "playwright")
+        os.makedirs(pw_dir, exist_ok=True)
+        conftest_path = os.path.join(pw_dir, "conftest.py")
+        if not os.path.exists(conftest_path):
+            _write(conftest_path, _generate_pw_conftest(
+                os.getenv("SFCC_SITE_URL", BASE_URL)))
+        pw_path = os.path.join(pw_dir, f"{fslug}_test.py")
+        result.playwright_path = pw_path
+        if os.path.exists(pw_path):
+            print(f"[script_generator] UPDATE Playwright: {pw_path}")
+            _write(pw_path, _update_playwright(
+                open(pw_path, encoding="utf-8").read(), feature, env))
+        else:
+            print(f"[script_generator] CREATE Playwright: {pw_path}")
+            _write(pw_path, _playwright_test_template(feature, env))
+
     # LoadRunner path set here — journey generated once in generate_all
     result.loadrunner_path = os.path.join(root, "loadrunner", "full_journey_lr_test.c")
 
@@ -1067,8 +1207,8 @@ def _generate_lr_journey(features: List[FeatureChange], env: str, repo: str) -> 
             endpoints_desc = "\n".join(
                 f"  {f.method} {f.path} — {f.description}" for f in sorted_features
             )
-            resp = _get_client().chat.completions.create(
-                model=OPENAI_MODEL,
+            resp = get_llm_client().chat.completions.create(
+                model=get_model(),
                 messages=[{"role": "user", "content": f"""Update this LoadRunner VuGen C journey script for changed endpoints.
 Repo: {repo}
 Base URL: {os.getenv('SFCC_SITE_URL', 'http://localhost:8000')}

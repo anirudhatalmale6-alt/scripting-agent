@@ -20,6 +20,7 @@ import subprocess
 from dataclasses import dataclass
 from typing import Optional
 from dotenv import load_dotenv
+from agent.llm_provider import get_llm_client, get_model, llm_available
 
 load_dotenv()
 
@@ -29,7 +30,6 @@ MAX_RETRIES   = 3
 K6_VUS        = int(os.getenv("K6_VUS", "10"))
 K6_DURATION   = os.getenv("K6_DURATION", "30s")
 SFCC_SITE_URL = os.getenv("SFCC_SITE_URL", "")
-OPENAI_MODEL  = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 USE_SANDBOX   = os.getenv("USE_SANDBOX", "true").lower() == "true"
 
 
@@ -46,8 +46,7 @@ class TestResult:
 
 
 def _openai_available():
-    key = os.getenv("OPENAI_API_KEY", "")
-    return bool(key) and "xxxxxx" not in key and key.startswith("sk-")
+    return llm_available()
 
 def _read(path):
     with open(path, encoding="utf-8") as f:
@@ -72,8 +71,7 @@ def _ai_fix(script_path, error, script_type):
     if not _openai_available():
         return None
     try:
-        from openai import OpenAI
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+        client = get_llm_client()
         current = _read(script_path)
         if script_type == "k6":
             lang, req = "k6 JavaScript", "valid k6 JS, no markdown fences"
@@ -82,7 +80,7 @@ def _ai_fix(script_path, error, script_type):
         else:
             lang, req = "LoadRunner VuGen C", "valid C, fix syntax, no fences"
         resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=get_model(),
             messages=[{"role": "user", "content":
                 f"Fix this failing {lang} script.\nError:\n{error[:2000]}\n"
                 f"Requirements: {req}\nDo NOT change what is being tested.\n"

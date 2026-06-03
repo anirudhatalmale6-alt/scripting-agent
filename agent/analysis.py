@@ -1,11 +1,5 @@
-import os
-from openai import OpenAI
-from dotenv import load_dotenv
+from agent.llm_provider import llm_chat
 
-load_dotenv()
-
-client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 
 def analyze_results(data):
 
@@ -25,14 +19,4 @@ Tasks:
 Provide a clear explanation in natural language.
 """
 
-    response = client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-    )
-
-    return response.choices[0].message.content
+    return llm_chat(prompt, temperature=0.2)

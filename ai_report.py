@@ -1,21 +1,6 @@
 # ai_report.py
 
-import os
-from dotenv import load_dotenv
-from openai import OpenAI
-
-# Load environment variables
-load_dotenv()
-
-# Get OpenAI API key
-api_key = os.getenv("OPENAI_API_KEY")
-
-if not api_key:
-    raise ValueError("OPENAI_API_KEY not found in environment variables")
-
-# Create OpenAI client
-client = OpenAI(api_key=api_key)
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+from agent.llm_provider import llm_chat
 
 
 def generate_ai_report(data):
@@ -36,17 +21,8 @@ Performance Data:
 """
 
     try:
-        response = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "You are a senior performance engineer."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.2
-        )
-
-        return response.choices[0].message.content
-
+        return llm_chat(prompt, temperature=0.2,
+                        system="You are a senior performance engineer.")
     except Exception as e:
         return f"AI Report Error: {str(e)}"
 

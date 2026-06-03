@@ -28,8 +28,8 @@ from datetime import datetime
 import psutil
 from dotenv import load_dotenv
 from flask import Flask, jsonify, request
-from openai import OpenAI
 
+from agent.llm_provider import get_llm_client, get_model, llm_available
 from agent.mcp_client import call_tool
 from agent.perf_policy import load_policy, get_thresholds, get_profile, load_agent_skill, PerfPolicy
 from typing import Optional
@@ -58,7 +58,6 @@ log = logging.getLogger("rca_agent")
 # ── Config ────────────────────────────────────────────────────────────────────
 
 OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")
-OPENAI_MODEL    = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
 ENABLE_AI       = os.getenv("ENABLE_AI", "true")
 JIRA_URL        = os.getenv("JIRA_URL")
 JIRA_EMAIL      = os.getenv("JIRA_EMAIL")
@@ -95,19 +94,8 @@ def _get_platform_skill() -> str:
         _platform_skill = load_agent_skill("PERF_AGENTS.md")
     return _platform_skill
 
-client = None
-
 def _get_openai_client():
-    global client
-    if client is not None:
-        return client
-    key = os.getenv("OPENAI_API_KEY", "")
-    if key and "xxxxxx" not in key and key.startswith("sk-"):
-        try:
-            client = OpenAI(api_key=key)
-        except Exception as e:
-            log.warning(f"[rca_agent] OpenAI init failed: {e}")
-    return client
+    return get_llm_client()
 app    = Flask(__name__)
 
 
@@ -243,7 +231,7 @@ Detected Issues: {data['issues']}
 Performance Data: {data}"""
 
         resp = c.chat.completions.create(
-            model=OPENAI_MODEL,
+            model=get_model(),
             messages=[
                 {"role": "system", "content": system_prompt},
                 {"role": "user",   "content": prompt},

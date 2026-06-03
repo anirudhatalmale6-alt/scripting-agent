@@ -344,18 +344,18 @@ def _fix_failing_scripts(pre_health: HealthReport) -> List[str]:
         _openai_available, _inject_options_if_missing, _write,
     )
     from agent.code_change_detector import FeatureChange
-    from openai import OpenAI
+    from agent.llm_provider import get_llm_client, get_model
 
     fixed = []
     if not pre_health.failing:
         return fixed
 
     if not _openai_available():
-        log.info("[orchestrator] No OpenAI key — skipping auto-fix")
+        log.info("[orchestrator] No LLM available — skipping auto-fix")
         return fixed
 
     log.info(f"[orchestrator] Auto-fixing {len(pre_health.failing)} pre-existing failures...")
-    client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
+    client = get_llm_client()
     skill_context = ""
     skill = _get_scripting_skill()
     if skill and "## What You Must Never Do" in skill:
@@ -372,7 +372,7 @@ def _fix_failing_scripts(pre_health: HealthReport) -> List[str]:
         try:
             current = open(path, encoding="utf-8").read()
             resp = client.chat.completions.create(
-                model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+                model=get_model(),
                 messages=[{"role": "user", "content": (
                     f"Fix this failing k6 script.\n"
                     f"Error: {sr.error[:1000]}\n"
