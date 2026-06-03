@@ -1122,6 +1122,177 @@ def page(browser):
 '''
 
 
+# ── Playwright journey (full user flow) ─────────────────────────────────────
+
+def _pw_journey_template(features: List[FeatureChange], env: str) -> str:
+    base_url = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
+
+    order = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 2, "DELETE": 3}
+    sorted_features = sorted(features, key=lambda f: (order.get(f.method.upper(), 9), f.path))
+
+    resources = {}
+    for f in sorted_features:
+        parts = [p for p in f.path.strip("/").split("/")
+                 if p and not p.startswith("{") and p != "api"]
+        resource = parts[0] if parts else "default"
+        resources.setdefault(resource, []).append(f)
+
+    api_steps = []
+    ui_steps = []
+    step_num = 0
+
+    for resource, feats in resources.items():
+        post_feats = [f for f in feats if f.method.upper() == "POST"]
+        get_feats = [f for f in feats if f.method.upper() == "GET"]
+        del_feats = [f for f in feats if f.method.upper() == "DELETE"]
+
+        if post_feats:
+            step_num += 1
+            f = post_feats[0]
+            path_safe = re.sub(r'\{[^}]+\}', '1', f.path)
+            api_steps.append(f'''
+    # Step {step_num}: Create {resource}
+    resp = ctx.post(
+        f"{{BASE_URL}}{path_safe}",
+        data={{{{key: "test_value" for key in ["name", "email", "price", "stock"]}}}},
+    )
+    assert resp.status in (200, 201), f"Create {resource} failed: {{resp.status}}"
+    created_{resource} = resp.json()
+    print(f"  Step {step_num}: Created {resource} — ID {{created_{resource}.get('id')}}")''')
+
+        if get_feats:
+            step_num += 1
+            f = get_feats[0]
+            path_safe = re.sub(r'\{[^}]+\}', '1', f.path)
+            api_steps.append(f'''
+    # Step {step_num}: List {resource}
+    resp = ctx.get(f"{{BASE_URL}}{path_safe}")
+    assert resp.status == 200, f"List {resource} failed: {{resp.status}}"
+    print(f"  Step {step_num}: Listed {resource} — {{len(resp.json())}} items")''')
+
+        # UI navigation step
+        tab_id = f"tab-{resource}" if resource != "users" else ""
+        if tab_id:
+            ui_steps.append(f'''
+    # Navigate to {resource.capitalize()} tab
+    page.click("#{tab_id}")
+    page.wait_for_timeout(500)''')
+
+    cleanup_steps = []
+    for resource, feats in reversed(list(resources.items())):
+        del_feats = [f for f in feats if f.method.upper() == "DELETE"]
+        if del_feats:
+            f = del_feats[0]
+            cleanup_steps.append(f'''
+    # Cleanup: delete {resource}
+    if created_{resource}:
+        ctx.delete(f"{{BASE_URL}}/{resource}/{{created_{resource}['id']}}")''')
+
+    api_body = "\n".join(api_steps)
+    ui_body = "\n".join(ui_steps) if ui_steps else "\n    pass"
+    cleanup_body = "\n".join(cleanup_steps) if cleanup_steps else "\n    pass"
+
+    return f'''"""
+Playwright JOURNEY TEST — Full E2E User Flow
+Env: {env}
+Covers: {" → ".join(resources.keys())}
+
+This test runs the complete user journey across all pages:
+{chr(10).join(f"  - {r.capitalize()}: {", ".join(f.method + " " + f.path for f in fs)}" for r, fs in resources.items())}
+
+Run with: pytest full_journey_test.py -v -s
+"""
+import os
+import time
+import pytest
+from playwright.sync_api import Page, expect
+
+BASE_URL = os.getenv("SFCC_SITE_URL", "{base_url}")
+
+
+class TestFullJourney:
+    """End-to-end journey: {" → ".join(r.capitalize() for r in resources.keys())}"""
+
+    def test_full_journey_api(self, page: Page):
+        """Complete API journey — create, read, verify across all resources."""
+        ctx = page.context.request
+        print("\\n=== Full API Journey ===")
+{api_body}
+        print("  Journey complete!")
+
+    def test_full_journey_ui(self, page: Page):
+        """Complete UI journey — navigate all tabs, verify pages load."""
+        print("\\n=== Full UI Journey ===")
+        page.goto(BASE_URL)
+        expect(page).not_to_have_url("about:blank")
+        print(f"  Home page loaded: {{page.title()}}")
+{ui_body}
+        print("  UI journey complete!")
+
+    def test_journey_performance(self, page: Page):
+        """Measure total journey time across all pages."""
+        pages_to_visit = [BASE_URL]
+        total_ms = 0
+        for url in pages_to_visit:
+            start = time.time()
+            page.goto(url)
+            ms = (time.time() - start) * 1000
+            total_ms += ms
+        assert total_ms < 15000, f"Full journey took {{total_ms:.0f}}ms (threshold: 15000ms)"
+        print(f"  Total journey time: {{total_ms:.0f}}ms")
+'''
+
+
+def _generate_pw_journey(features: List[FeatureChange], env: str, repo: str) -> None:
+    root = _script_root(repo, env)
+    pw_dir = os.path.join(root, "playwright")
+    os.makedirs(pw_dir, exist_ok=True)
+    path = os.path.join(pw_dir, "full_journey_test.py")
+
+    order = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 2, "DELETE": 3}
+    sorted_features = sorted(features, key=lambda f: (order.get(f.method.upper(), 9), f.path))
+
+    if _openai_available() and os.path.exists(path):
+        try:
+            endpoints_desc = "\n".join(
+                f"  {f.method} {f.path} — {f.description}" for f in sorted_features
+            )
+            resp = get_llm_client().chat.completions.create(
+                model=get_model(),
+                messages=[{"role": "user", "content": f"""Update this Python Playwright journey test for the changed endpoints.
+The journey must test the COMPLETE user flow across ALL endpoints in order.
+Base URL: {os.getenv('SFCC_SITE_URL', 'http://localhost:8000')}
+Endpoints (in user journey order):
+{endpoints_desc}
+
+Requirements:
+- One test class TestFullJourney with test methods for API journey, UI journey, performance
+- API journey: create resources, verify they exist, then cleanup
+- UI journey: navigate each page/tab, verify elements load
+- Performance: measure total journey time
+- Use page.context.request for API calls, page.goto() for UI
+- Return ONLY Python code, no fences.
+---
+{open(path, encoding='utf-8').read()}"""}],
+                temperature=0,
+            )
+            content = _strip_fences(resp.choices[0].message.content.strip())
+        except Exception as e:
+            print(f"[script_generator] GPT Playwright journey update failed: {e} — using template")
+            content = _pw_journey_template(sorted_features, env)
+    else:
+        content = _pw_journey_template(sorted_features, env)
+
+    action = "UPDATE" if os.path.exists(path) else "CREATE"
+    print(f"[script_generator] {action} Playwright journey: {path}")
+    _write(path, content)
+
+    conftest_path = os.path.join(pw_dir, "conftest.py")
+    if not os.path.exists(conftest_path):
+        _write(conftest_path, _generate_pw_conftest(
+            os.getenv("SFCC_SITE_URL", BASE_URL)))
+
+
 # ── Public API ────────────────────────────────────────────────────────────────
 
 def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -> GeneratedScripts:
@@ -1351,6 +1522,10 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
     # Generate one combined LoadRunner journey script covering all endpoints
     if meaningful and os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true":
         _generate_lr_journey(meaningful, env, repo)
+
+    # Generate one combined Playwright journey test covering the full user flow
+    if meaningful and os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true":
+        _generate_pw_journey(meaningful, env, repo)
 
     # Ensure selenium index reflects everything on disk after batch generation
     if meaningful and os.getenv("ENABLE_SELENIUM", "true").lower() == "true":
