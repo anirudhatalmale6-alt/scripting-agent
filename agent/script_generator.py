@@ -1333,8 +1333,11 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
         result.selenium_path = test_path
 
     # ── Playwright ────────────────────────────────────────────────────────────
+    # Skip per-endpoint Playwright files when MCP mode is active —
+    # MCP generates a single unified journey file instead
     enable_pw = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true"
-    if enable_pw:
+    is_mcp_mode = os.getenv("TEST_GEN_MODE", "default").lower().strip() == "mcp"
+    if enable_pw and not is_mcp_mode:
         pw_dir = os.path.join(root, "playwright")
         os.makedirs(pw_dir, exist_ok=True)
         conftest_path = os.path.join(pw_dir, "conftest.py")
@@ -1531,7 +1534,8 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
         _generate_lr_journey(meaningful, env, repo)
 
     # Generate one combined Playwright journey test covering the full user flow
-    if meaningful and os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true":
+    # Skip when MCP mode is active — MCP generates its own unified journey
+    if meaningful and os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true" and test_gen_mode != "mcp":
         _generate_pw_journey(meaningful, env, repo)
 
     # Ensure selenium index reflects everything on disk after batch generation
