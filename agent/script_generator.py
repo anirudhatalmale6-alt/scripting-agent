@@ -1720,7 +1720,7 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
             from agent.test_case_generator import generate_test_cases
             repo_path = os.getenv("LOCAL_REPO_PATH", ".")
             repo_name = os.getenv("REPO_NAME", repo or "app")
-            tc_dir = os.path.join(root, "test_cases")
+            tc_dir = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "test_cases")
             print(f"[script_generator] MODE 2: Generating test cases CSV from {repo_path}")
             csv_path = generate_test_cases(repo_path, tc_dir, repo_name)
             if csv_path:
