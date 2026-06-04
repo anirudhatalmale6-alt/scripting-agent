@@ -414,6 +414,14 @@ if __name__ == "__main__":
             result = local_scan()
             log.info(f"[startup] Scan complete: {result.get('endpoints_detected', 0)} endpoints, "
                      f"{result.get('scripts_generated', 0)} scripts generated")
+
+            if os.getenv("AUTO_SHUTDOWN", "true").lower() == "true":
+                log.info("[startup] All scripts generated. Shutting down automatically...")
+                log.info("=" * 60)
+                log.info("  DONE — Scripts are in the scripts/ folder")
+                log.info("=" * 60)
+                time.sleep(1)
+                os._exit(0)
             return
 
         if GITHUB_REPO:
