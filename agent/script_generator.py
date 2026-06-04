@@ -1297,47 +1297,21 @@ Requirements:
 
 def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -> GeneratedScripts:
     """
-    Create or update scripts for one feature.
-    Respects ENABLE_K6, ENABLE_SELENIUM, ENABLE_LOADRUNNER flags.
-    Uses templates on CREATE (no AI), AI only on UPDATE (webhook-triggered).
-    Registers every Selenium script in the selenium index after write.
+    Create or update per-endpoint scripts for one feature.
+    Order: Playwright → LoadRunner → Selenium → k6
+    Respects ENABLE_* flags for each type.
     """
     root   = _script_root(repo, env)
     fslug  = _slug(feature.path)
     result = GeneratedScripts(feature=feature)
 
-    enable_k6  = os.getenv("ENABLE_K6",  "true").lower() == "true"
+    enable_pw  = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true"
+    enable_lr  = os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true"
     enable_sel = os.getenv("ENABLE_SELENIUM", "true").lower() == "true"
+    enable_k6  = os.getenv("ENABLE_K6",  "true").lower() == "true"
 
-    # ── k6 ────────────────────────────────────────────────────────────────────
-    if enable_k6:
-        k6_path = os.path.join(root, "k6", f"{fslug}_perf_test.js")
-        result.k6_path = k6_path
-        if os.path.exists(k6_path):
-            print(f"[script_generator] UPDATE k6: {k6_path}")
-            _write(k6_path, _update_k6(open(k6_path, encoding="utf-8").read(), feature, env))
-        else:
-            print(f"[script_generator] CREATE k6: {k6_path}")
-            _write(k6_path, _k6_template(feature, env))
-    result.k6_validated = True
-
-    # ── Selenium — routed through _generate_selenium_java ────────────────────
-    # This function handles CREATE vs UPDATE, surgical updates, and index registration
-    if enable_sel:
-        sel_root = os.path.join(root, "selenium")
-        test_path = _generate_selenium_java(
-            feature,
-            sel_root=sel_root,
-            base_url=os.getenv("SFCC_SITE_URL", BASE_URL),
-        )
-        result.selenium_path = test_path
-
-    # ── Playwright ────────────────────────────────────────────────────────────
-    # Skip per-endpoint Playwright files when MCP mode is active —
-    # MCP generates a single unified journey file instead
-    enable_pw = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true"
-    is_mcp_mode = os.getenv("TEST_GEN_MODE", "default").lower().strip() == "mcp"
-    if enable_pw and not is_mcp_mode:
+    # ── 1. Playwright (per-endpoint) ─────────────────────────────────────────
+    if enable_pw:
         pw_dir = os.path.join(root, "playwright")
         os.makedirs(pw_dir, exist_ok=True)
         conftest_path = os.path.join(pw_dir, "conftest.py")
@@ -1354,8 +1328,41 @@ def generate_scripts(feature: FeatureChange, env: str = "dev", repo: str = "") -
             print(f"[script_generator] CREATE Playwright: {pw_path}")
             _write(pw_path, _playwright_test_template(feature, env))
 
-    # LoadRunner path set here — journey generated once in generate_all
-    result.loadrunner_path = os.path.join(root, "loadrunner", "full_journey_lr_test.c")
+    # ── 2. LoadRunner (per-endpoint) ─────────────────────────────────────────
+    if enable_lr:
+        lr_dir = os.path.join(root, "loadrunner")
+        os.makedirs(lr_dir, exist_ok=True)
+        lr_path = os.path.join(lr_dir, f"{fslug}_lr_test.c")
+        result.loadrunner_path = lr_path
+        if os.path.exists(lr_path):
+            print(f"[script_generator] UPDATE LoadRunner: {lr_path}")
+            _write(lr_path, _update_loadrunner(
+                open(lr_path, encoding="utf-8").read(), feature))
+        else:
+            print(f"[script_generator] CREATE LoadRunner: {lr_path}")
+            _write(lr_path, _lr_template(feature))
+
+    # ── 3. Selenium (per-endpoint) ───────────────────────────────────────────
+    if enable_sel:
+        sel_root = os.path.join(root, "selenium")
+        test_path = _generate_selenium_java(
+            feature,
+            sel_root=sel_root,
+            base_url=os.getenv("SFCC_SITE_URL", BASE_URL),
+        )
+        result.selenium_path = test_path
+
+    # ── 4. k6 (per-endpoint) ────────────────────────────────────────────────
+    if enable_k6:
+        k6_path = os.path.join(root, "k6", f"{fslug}_perf_test.js")
+        result.k6_path = k6_path
+        if os.path.exists(k6_path):
+            print(f"[script_generator] UPDATE k6: {k6_path}")
+            _write(k6_path, _update_k6(open(k6_path, encoding="utf-8").read(), feature, env))
+        else:
+            print(f"[script_generator] CREATE k6: {k6_path}")
+            _write(k6_path, _k6_template(feature, env))
+    result.k6_validated = True
 
     return result
 
@@ -1465,6 +1472,147 @@ vuser_end()
 '''
 
 
+def _generate_k6_journey(features: List[FeatureChange], env: str, repo: str) -> None:
+    """Generate ONE k6 journey script covering all endpoints in sequence."""
+    root = _script_root(repo, env)
+    k6_dir = os.path.join(root, "k6")
+    os.makedirs(k6_dir, exist_ok=True)
+    path = os.path.join(k6_dir, "full_journey_k6_test.js")
+
+    order = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 2, "DELETE": 3}
+    sorted_features = sorted(features, key=lambda f: (order.get(f.method.upper(), 9), f.path))
+
+    base_url = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
+    profile = get_profile("pull_request", _get_policy())
+    vus = profile.k6_vus if profile else 10
+    duration = profile.k6_duration if profile else "30s"
+
+    steps = []
+    for i, f in enumerate(sorted_features, 1):
+        method = f.method.lower()
+        path_safe = re.sub(r'\{[^}]+\}', '1', f.path)
+        t = _thresholds_for(f)
+        if method in ("post", "put", "patch"):
+            steps.append(
+                f"  // Step {i}: {f.method} {f.path}\n"
+                f"  const payload_{i} = JSON.stringify({{/* TODO: request body */}});\n"
+                f"  const params_{i} = {{ headers: {{ 'Content-Type': 'application/json' }} }};\n"
+                f"  res = http.{method}(`${{BASE_URL}}{path_safe}`, payload_{i}, params_{i});\n"
+                f"  check(res, {{ 'step {i} status ok': (r) => r.status >= 200 && r.status < 500 }});\n"
+                f"  sleep(1);"
+            )
+        elif method == "delete":
+            steps.append(
+                f"  // Step {i}: {f.method} {f.path}\n"
+                f"  res = http.del(`${{BASE_URL}}{path_safe}`);\n"
+                f"  check(res, {{ 'step {i} status ok': (r) => r.status >= 200 && r.status < 500 }});\n"
+                f"  sleep(1);"
+            )
+        else:
+            steps.append(
+                f"  // Step {i}: {f.method} {f.path}\n"
+                f"  res = http.get(`${{BASE_URL}}{path_safe}`);\n"
+                f"  check(res, {{ 'step {i} status ok': (r) => r.status >= 200 && r.status < 500 }});\n"
+                f"  sleep(1);"
+            )
+
+    steps_block = "\n\n".join(steps)
+    content = f"""// k6 Full Journey Test — All Endpoints
+// Covers: {", ".join(f"{f.method} {f.path}" for f in sorted_features)}
+// Env: {env}
+
+import http from 'k6/http';
+import {{ check, sleep }} from 'k6';
+
+const BASE_URL = __ENV.SFCC_SITE_URL || '{base_url}';
+
+export const options = {{
+  vus: {vus},
+  duration: '{duration}',
+  thresholds: {{
+    http_req_duration: ['p(95)<2000'],
+    http_req_failed:   ['rate<0.1'],
+  }},
+  tags: {{ test_type: 'journey', env: '{env}' }},
+}};
+
+export default function () {{
+  let res;
+
+{steps_block}
+}}
+"""
+    action = "UPDATE" if os.path.exists(path) else "CREATE"
+    print(f"[script_generator] {action} k6 journey: {path}")
+    _write(path, content)
+
+
+def _generate_selenium_journey(features: List[FeatureChange], env: str, repo: str) -> None:
+    """Generate ONE Selenium Java journey test covering all endpoints."""
+    root = _script_root(repo, env)
+    sel_root = os.path.join(root, "selenium")
+    test_dir = os.path.join(sel_root, "src", "test", "java", "com", "ecommerce", "tests")
+    os.makedirs(test_dir, exist_ok=True)
+    path = os.path.join(test_dir, "FullJourneyTest.java")
+
+    base_url = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
+    order = {"GET": 0, "POST": 1, "PUT": 2, "PATCH": 2, "DELETE": 3}
+    sorted_features = sorted(features, key=lambda f: (order.get(f.method.upper(), 9), f.path))
+
+    test_steps = []
+    for i, f in enumerate(sorted_features, 1):
+        path_safe = re.sub(r'\{[^}]+\}', '1', f.path)
+        test_steps.append(
+            f'        // Step {i}: {f.method} {f.path}\n'
+            f'        driver.get(BASE_URL + "{path_safe}");\n'
+            f'        Assert.assertNotNull("Page should load for {f.path}",\n'
+            f'            driver.findElement(By.tagName("body")));\n'
+            f'        System.out.println("  Step {i}: {f.method} {f.path} — OK");'
+        )
+
+    steps_block = "\n\n".join(test_steps)
+    endpoints_comment = "\n".join(f" *   {f.method} {f.path}" for f in sorted_features)
+
+    content = f'''package com.ecommerce.tests;
+
+import org.openqa.selenium.By;
+import org.testng.Assert;
+import org.testng.annotations.Test;
+
+/**
+ * Full Journey Test — all endpoints in sequence
+ * Endpoints covered:
+{endpoints_comment}
+ */
+public class FullJourneyTest extends BaseTest {{
+
+    @Test(description = "Full journey through all endpoints")
+    public void testFullJourney() {{
+        System.out.println("=== Full Selenium Journey ===");
+
+{steps_block}
+
+        System.out.println("=== Journey Complete ===");
+    }}
+
+    @Test(description = "Journey performance — total navigation time")
+    public void testJourneyPerformance() {{
+        long start = System.currentTimeMillis();
+
+{steps_block}
+
+        long totalMs = System.currentTimeMillis() - start;
+        System.out.println("Total journey time: " + totalMs + "ms");
+        Assert.assertTrue(totalMs < 30000,
+            "Full journey took " + totalMs + "ms (threshold: 30000ms)");
+    }}
+}}
+'''
+    action = "UPDATE" if os.path.exists(path) else "CREATE"
+    print(f"[script_generator] {action} Selenium journey: {path}")
+    _write(path, content)
+
+
 def _is_meaningful_path(path: str) -> bool:
     """Filter out paths that produce no useful slug — e.g. '/', '/{id}' only."""
     slug = re.sub(r'[^a-z0-9]+', '_', path.lower()).strip('_')
@@ -1507,15 +1655,18 @@ def _deduplicate_features(features: List[FeatureChange]) -> List[FeatureChange]:
 def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = "") -> List[GeneratedScripts]:
     """
     Generate/update scripts for all features.
+    Order: Playwright → LoadRunner → Selenium → k6
+    Each type generates BOTH per-endpoint files AND one journey file.
 
-    Supports 3 test generation modes controlled by env vars:
-      Mode 3 (default): TEST_GEN_MODE=default — scan code, generate scripts directly
-      Mode 1: TEST_GEN_MODE=mcp, TEST_CASE_MODE=false — Playwright MCP browses live app
-      Mode 2: TEST_GEN_MODE=mcp, TEST_CASE_MODE=true — generate CSV test cases first,
-              then Playwright MCP uses CSV to drive test generation
+    MCP modes (TEST_GEN_MODE=mcp) add additional MCP-generated files on top.
     """
     test_gen_mode = os.getenv("TEST_GEN_MODE", "default").lower().strip()
     test_case_mode = os.getenv("TEST_CASE_MODE", "false").lower().strip() == "true"
+
+    enable_pw  = os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true"
+    enable_lr  = os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true"
+    enable_sel = os.getenv("ENABLE_SELENIUM", "true").lower() == "true"
+    enable_k6  = os.getenv("ENABLE_K6", "true").lower() == "true"
 
     results = []
     meaningful = [f for f in features if _is_meaningful_path(f.path)]
@@ -1524,30 +1675,39 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
     if skipped:
         print(f"[script_generator] Skipped {skipped} features with no meaningful path slug")
 
-    # ── Mode 3 (default): scan code → generate scripts directly ──────────────
+    # ── Per-endpoint generation (Playwright → LoadRunner → Selenium → k6) ────
     for feature in meaningful:
         print(f"[script_generator] {feature.method} {feature.path} → repo={repo or 'default'} env={env}")
         results.append(generate_scripts(feature, env, repo))
 
-    # Generate one combined LoadRunner journey script covering all endpoints
-    if meaningful and os.getenv("ENABLE_LOADRUNNER", "true").lower() == "true":
-        _generate_lr_journey(meaningful, env, repo)
+    # ── Journey generation (one file per type, same order) ───────────────────
+    if meaningful:
+        # 1. Playwright journey
+        if enable_pw:
+            _generate_pw_journey(meaningful, env, repo)
 
-    # Generate one combined Playwright journey test covering the full user flow
-    # Skip when MCP mode is active — MCP generates its own unified journey
-    if meaningful and os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true" and test_gen_mode != "mcp":
-        _generate_pw_journey(meaningful, env, repo)
+        # 2. LoadRunner journey
+        if enable_lr:
+            _generate_lr_journey(meaningful, env, repo)
 
-    # Ensure selenium index reflects everything on disk after batch generation
-    if meaningful and os.getenv("ENABLE_SELENIUM", "true").lower() == "true":
+        # 3. Selenium journey
+        if enable_sel:
+            _generate_selenium_journey(meaningful, env, repo)
+
+        # 4. k6 journey
+        if enable_k6:
+            _generate_k6_journey(meaningful, env, repo)
+
+    # ── Selenium index refresh ───────────────────────────────────────────────
+    if meaningful and enable_sel:
         sel_root = os.path.join(_script_root(repo, env), "selenium")
         if os.path.isdir(sel_root):
             from agent.selenium_index import get_or_build_index
             get_or_build_index(sel_root)
             print(f"[script_generator] Selenium index refreshed: {sel_root}")
 
-    # ── MCP modes (Mode 1 and Mode 2) ────────────────────────────────────────
-    if test_gen_mode == "mcp" and os.getenv("ENABLE_PLAYWRIGHT", "true").lower() == "true":
+    # ── MCP modes (additional Playwright files on top) ───────────────────────
+    if test_gen_mode == "mcp" and enable_pw:
         from agent.mcp_test_generator import generate_mcp_tests
 
         target_url = os.getenv("SFCC_SITE_URL", "http://localhost:8000")
@@ -1557,7 +1717,6 @@ def generate_all(features: List[FeatureChange], env: str = "dev", repo: str = ""
 
         csv_path = None
         if test_case_mode:
-            # Mode 2: generate CSV test cases first, then MCP
             from agent.test_case_generator import generate_test_cases
             repo_path = os.getenv("LOCAL_REPO_PATH", ".")
             repo_name = os.getenv("REPO_NAME", repo or "app")
